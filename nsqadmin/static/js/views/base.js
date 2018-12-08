@@ -51,13 +51,16 @@ var BaseView = Backbone.View.extend({
                 AppState.get('graph_interval') !== 'off',
             'nsqlookupd': AppState.get('NSQLOOKUPD'),
             'allnsqlookupds': AppState.get('ALLNSQLOOKUPDS'),
+            'dcnsqlookupd' : AppState.get('DCNSQLOOKUPD'),
+            'dcallnsqlookupds' : AppState.get('DCALLNSQLOOKUPDS'),
             'version': AppState.get('VERSION'),
             'auth_url': AppState.get('AUTH_URL'),
             'logout_url': AppState.get('LOGOUT_URL'),
             'auth_enabled': AppState.get('AUTH_ENABLED'),
             'login'     : AppState.get('LOGIN'),
             'user'      : AppState.get('USER'),
-            'hasEndpoint' : AppState.get('HAS_ENDPOINT')
+            'hasEndpoint' : AppState.get('HAS_ENDPOINT'),
+            'enable_zan_test_skip' : AppState.get('ENABLE_ZAN_TEST_SKIP')
         };
         if (this.model) {
             ctx = _.extend(ctx, this.model.toJSON());
@@ -118,6 +121,12 @@ var BaseView = Backbone.View.extend({
     handleViewError: function(jqXHR) {
         this.removeSubviews();
         this.$el.html(errorTemplate({'message': this.parseErrorMessage(jqXHR)}));
+    },
+
+    showError: function(errMsg) {
+        $('#warning, #error').hide();
+        $('#error .alert').text(JSON.stringify(errMsg));
+        $('#error').show();
     }
 });
 

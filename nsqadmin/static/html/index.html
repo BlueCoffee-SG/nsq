@@ -27,12 +27,15 @@
         var STATSD_PREFIX = '{{.StatsdPrefix}}';
         var NSQLOOKUPD = [{{range .NSQLookupd}}'{{.}}',{{end}}];
         var ALLNSQLOOKUPDS = [{{range .AllNSQLookupds}}'{{.}}',{{end}}];
+        var DCNSQLOOKUPD = {{.DCNSQLookupd | dcLookupdList}};
+        var DCALLNSQLOOKUPDS = {{.DCAllNSQLookupds | dcLookupdList}};
         var AUTH_URL = '{{.AuthUrl}}';
         var LOGOUT_URL = '{{.LogoutUrl}}';
         var LOGIN        = {{if .Login}}true{{else}}false{{end}};
         var USER         = '{{.User}}';
         var AUTH_ENABLED = {{if .AuthEnabled}}true{{else}}false{{end}};
         var HAS_ENDPOINT = {{if .HasNotificationEndpoint}}true{{else}}false{{end}};
+        var ENABLE_ZAN_TEST_SKIP = {{if .EnableZanTestSkip}}true{{else}}false{{end}}
     </script>
     <script src="/static/vendor.js"></script>
     <script src="/static/main.js"></script>

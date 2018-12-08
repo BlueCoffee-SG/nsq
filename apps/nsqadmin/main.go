@@ -62,15 +62,20 @@ var (
 
 	nsqlookupdHTTPAddresses = app.StringArray{}
 	nsqdHTTPAddresses       = app.StringArray{}
+	dcNsqlookupdHTTPAddresses = app.StringArray{}
+
 	accessTokens = app.StringArray{}
 
 	accessControlFile = flagSet.String("access-control-file", "", "administrator access control file")
+
+	enableZanTestSkip = flagSet.Bool("enable-zan-test-skip", false, "enable skip zan test message")
 )
 
 func init() {
 	flagSet.Var(&nsqlookupdHTTPAddresses, "lookupd-http-address", "lookupd HTTP address (may be given multiple times)")
 	flagSet.Var(&nsqdHTTPAddresses, "nsqd-http-address", "nsqd HTTP address (may be given multiple times)")
 	flagSet.Var(&accessTokens, "access-tokens", "access token for api access")
+	flagSet.Var(&dcNsqlookupdHTTPAddresses, "dc-lookupd-http-address", "lookupd HTTP address (may be given multiple times) with data center info")
 }
 
 func main() {
@@ -102,7 +107,6 @@ func main() {
 			log.Fatalf("ERROR: failed to load config file %s - %s", *config, err)
 		}
 	}
-
 	opts := nsqadmin.NewOptions()
 	options.Resolve(opts, flagSet, cfg)
 	if opts.LogDir != "" {

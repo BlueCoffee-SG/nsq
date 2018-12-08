@@ -1,7 +1,7 @@
 language: go
 go:
-  - 1.8.x
   - 1.9.x
+  - 1.10.x
 env:
   - GOARCH=amd64 TEST_RACE=false
   - GOARCH=amd64 TEST_RACE=true
@@ -12,7 +12,7 @@ script:
   - curl -s https://raw.githubusercontent.com/pote/gpm/v1.4.0/bin/gpm > gpm
   - chmod +x gpm
   - ./gpm install
-  - ./test.sh
+  - travis_wait ./test.sh
 notifications:
   email: false
 

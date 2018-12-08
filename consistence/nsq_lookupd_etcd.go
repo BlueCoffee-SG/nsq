@@ -25,18 +25,8 @@ const (
 	EVENT_WATCH_TOPIC_L_DELETE
 )
 
-type WatchTopicLeaderInfo struct {
-	event       int
-	topic       string
-	partition   int
-	watchStopCh chan bool
-	stoppedCh   chan bool
-}
-
 type NsqLookupdEtcdMgr struct {
-	tmisMutex sync.Mutex
-	tmiMutex  sync.Mutex
-	wtliMutex sync.Mutex
+	tmiMutex sync.RWMutex
 
 	client            *EtcdClient
 	clusterID         string
@@ -46,19 +36,18 @@ type NsqLookupdEtcdMgr struct {
 	leaderStr         string
 	lookupdRootPath   string
 	topicMetaInfos    []TopicPartitionMetaInfo
-	topicMetaMap      map[string]*TopicMetaInfo
+	topicMetaMap      map[string]TopicMetaInfo
 	ifTopicChanged    int32
+	ifTopicScanning   int32
 	nodeInfo          *NsqLookupdNodeInfo
 	nodeKey           string
 	nodeValue         string
 
-	watchTopicLeaderChanMap   map[string]*WatchTopicLeaderInfo
-	watchTopicLeaderEventChan chan *WatchTopicLeaderInfo
+	refreshStopCh        chan bool
+	watchTopicsStopCh    chan bool
+	watchNsqdNodesStopCh chan bool
 
-	refreshStopCh          chan bool
-	watchTopicLeaderStopCh chan bool
-	watchTopicsStopCh      chan bool
-	watchNsqdNodesStopCh   chan bool
+	topicReplicasMap map[string]map[int]TopicPartitionReplicaInfo
 }
 
 func NewNsqLookupdEtcdMgr(host string) (*NsqLookupdEtcdMgr, error) {
@@ -67,15 +56,14 @@ func NewNsqLookupdEtcdMgr(host string) (*NsqLookupdEtcdMgr, error) {
 		return nil, err
 	}
 	return &NsqLookupdEtcdMgr{
-		client:                    client,
-		ifTopicChanged:            1,
-		watchTopicLeaderStopCh:    make(chan bool, 1),
-		watchTopicsStopCh:         make(chan bool, 1),
-		watchNsqdNodesStopCh:      make(chan bool, 1),
-		topicMetaMap:              make(map[string]*TopicMetaInfo),
-		watchTopicLeaderChanMap:   make(map[string]*WatchTopicLeaderInfo),
-		watchTopicLeaderEventChan: make(chan *WatchTopicLeaderInfo, 1),
-		refreshStopCh:             make(chan bool, 1),
+		client:               client,
+		ifTopicChanged:       1,
+		ifTopicScanning:      0,
+		watchTopicsStopCh:    make(chan bool, 1),
+		watchNsqdNodesStopCh: make(chan bool, 1),
+		topicMetaMap:         make(map[string]TopicMetaInfo),
+		refreshStopCh:        make(chan bool, 1),
+		topicReplicasMap:     make(map[string]map[int]TopicPartitionReplicaInfo),
 	}, nil
 }
 
@@ -148,9 +136,7 @@ func (self *NsqLookupdEtcdMgr) Unregister(value *NsqLookupdNodeInfo) error {
 
 func (self *NsqLookupdEtcdMgr) Stop() {
 	//	self.Unregister()
-	if self.watchTopicLeaderStopCh != nil {
-		close(self.watchTopicLeaderStopCh)
-	}
+
 	if self.watchNsqdNodesStopCh != nil {
 		close(self.watchNsqdNodesStopCh)
 	}
@@ -197,8 +183,8 @@ func (self *NsqLookupdEtcdMgr) AcquireAndWatchLeader(leader chan *NsqLookupdNode
 	master.Start()
 }
 
-func (self *NsqLookupdEtcdMgr) GetTopicsMetaInfoMap(topics []string) (map[string]*TopicMetaInfo, error) {
-	topicMetaInfoCache := make(map[string]*TopicMetaInfo)
+func (self *NsqLookupdEtcdMgr) GetTopicsMetaInfoMap(topics []string) (map[string]TopicMetaInfo, error) {
+	topicMetaInfoCache := make(map[string]TopicMetaInfo)
 	if atomic.LoadInt32(&self.ifTopicChanged) == 1 {
 		//fetch from etcd
 		for _, topic := range topics {
@@ -206,24 +192,20 @@ func (self *NsqLookupdEtcdMgr) GetTopicsMetaInfoMap(topics []string) (map[string
 			if err != nil {
 				return nil, err
 			}
-			topicMetaInfoCache[topic] = &topicMeta
+			topicMetaInfoCache[topic] = topicMeta
 		}
 	} else {
-		self.tmiMutex.Lock()
-		defer self.tmiMutex.Unlock()
+		self.tmiMutex.RLock()
+		defer self.tmiMutex.RUnlock()
 		for _, topic := range topics {
 			topicMeta, exist := self.topicMetaMap[topic]
 			if !exist {
-				coordLog.Infof("meta info for %v not exist", topic)
-				topicMetaInfoCache[topic] = &TopicMetaInfo{
+				topicMetaInfoCache[topic] = TopicMetaInfo{
 					OrderedMulti: false,
 					Ext:          false,
 				}
 			} else {
-				topicMetaInfoCache[topic] = &TopicMetaInfo{
-					OrderedMulti: topicMeta.OrderedMulti,
-					Ext:          topicMeta.Ext,
-				}
+				topicMetaInfoCache[topic] = topicMeta
 			}
 		}
 	}
@@ -276,11 +258,12 @@ func (self *NsqLookupdEtcdMgr) UpdateLookupEpoch(oldGen EpochType) (EpochType, e
 }
 
 func (self *NsqLookupdEtcdMgr) GetNsqdNodes() ([]NsqdNodeInfo, error) {
-	return self.getNsqdNodes()
+	nodes, _, err := self.getNsqdNodes(false)
+	return nodes, err
 }
 
 func (self *NsqLookupdEtcdMgr) WatchNsqdNodes(nsqds chan []NsqdNodeInfo, stop chan struct{}) {
-	nsqdNodes, err := self.getNsqdNodes()
+	nsqdNodes, nIndex, err := self.getNsqdNodes(false)
 	if err == nil {
 		select {
 		case nsqds <- nsqdNodes:
@@ -291,7 +274,7 @@ func (self *NsqLookupdEtcdMgr) WatchNsqdNodes(nsqds chan []NsqdNodeInfo, stop ch
 	}
 
 	key := self.createNsqdRootPath()
-	watcher := self.client.Watch(key, 0, true)
+	watcher := self.client.Watch(key, nIndex, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		select {
@@ -326,7 +309,7 @@ func (self *NsqLookupdEtcdMgr) WatchNsqdNodes(nsqds chan []NsqdNodeInfo, stop ch
 				}
 			}
 		}
-		nsqdNodes, err := self.getNsqdNodes()
+		nsqdNodes, _, err := self.getNsqdNodes(true)
 		if err != nil {
 			coordLog.Errorf("key[%s] getNsqdNodes error: %s", key, err.Error())
 			continue
@@ -340,13 +323,19 @@ func (self *NsqLookupdEtcdMgr) WatchNsqdNodes(nsqds chan []NsqdNodeInfo, stop ch
 	}
 }
 
-func (self *NsqLookupdEtcdMgr) getNsqdNodes() ([]NsqdNodeInfo, error) {
-	rsp, err := self.client.Get(self.createNsqdRootPath(), false, false)
+func (self *NsqLookupdEtcdMgr) getNsqdNodes(upToDate bool) ([]NsqdNodeInfo, uint64, error) {
+	var rsp *client.Response
+	var err error
+	if upToDate {
+		rsp, err = self.client.GetNewest(self.createNsqdRootPath(), false, false)
+	} else {
+		rsp, err = self.client.Get(self.createNsqdRootPath(), false, false)
+	}
 	if err != nil {
 		if client.IsKeyNotFound(err) {
-			return nil, ErrKeyNotFound
+			return nil, 0, ErrKeyNotFound
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	nsqdNodes := make([]NsqdNodeInfo, 0)
 	for _, node := range rsp.Node.Nodes {
@@ -360,13 +349,13 @@ func (self *NsqLookupdEtcdMgr) getNsqdNodes() ([]NsqdNodeInfo, error) {
 		}
 		nsqdNodes = append(nsqdNodes, nodeInfo)
 	}
-	return nsqdNodes, nil
+	return nsqdNodes, rsp.Index, err
 }
 
-func (self *NsqLookupdEtcdMgr) GetAllTopicMetas() (map[string]*TopicMetaInfo, error) {
-	self.tmisMutex.Lock()
+func (self *NsqLookupdEtcdMgr) GetAllTopicMetas() (map[string]TopicMetaInfo, error) {
+	self.tmiMutex.RLock()
 	topicMetas := self.topicMetaMap
-	self.tmisMutex.Unlock()
+	self.tmiMutex.RUnlock()
 	return topicMetas, nil
 }
 
@@ -375,15 +364,24 @@ func (self *NsqLookupdEtcdMgr) ScanTopics() ([]TopicPartitionMetaInfo, error) {
 		return self.scanTopics()
 	}
 
-	self.tmisMutex.Lock()
+	self.tmiMutex.RLock()
 	topicMetaInfos := self.topicMetaInfos
-	self.tmisMutex.Unlock()
+	self.tmiMutex.RUnlock()
 	return topicMetaInfos, nil
 }
 
 // watch topics if changed
 func (self *NsqLookupdEtcdMgr) watchTopics() {
-	watcher := self.client.Watch(self.topicRoot, 0, true)
+	initIndex := uint64(0)
+	rsp, err := self.client.Get(self.topicRoot, false, true)
+	if err != nil {
+		coordLog.Errorf("get topic root key[%s] error: %s", self.topicRoot, err.Error())
+	} else {
+		if rsp.Index > 0 {
+			initIndex = rsp.Index - 1
+		}
+	}
+	watcher := self.client.Watch(self.topicRoot, initIndex, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		select {
@@ -391,8 +389,9 @@ func (self *NsqLookupdEtcdMgr) watchTopics() {
 			cancel()
 		}
 	}()
+	atomic.StoreInt32(&self.ifTopicChanged, 1)
 	for {
-		_, err := watcher.Next(ctx)
+		rsp, err := watcher.Next(ctx)
 		if err != nil {
 			if err == context.Canceled {
 				coordLog.Infof("watch key[%s] canceled.", self.topicRoot)
@@ -415,14 +414,26 @@ func (self *NsqLookupdEtcdMgr) watchTopics() {
 				}
 			}
 		}
-		coordLog.Debugf("topic changed.")
+		coordLog.Debugf("topic changed: %v", rsp)
 		atomic.StoreInt32(&self.ifTopicChanged, 1)
 	}
 }
 
+func (self *NsqLookupdEtcdMgr) isCacheNewest() bool {
+	if atomic.LoadInt32(&self.ifTopicChanged) == 1 {
+		return false
+	}
+	if atomic.LoadInt32(&self.ifTopicScanning) == 1 {
+		return false
+	}
+	return true
+}
+
 func (self *NsqLookupdEtcdMgr) scanTopics() ([]TopicPartitionMetaInfo, error) {
+	atomic.StoreInt32(&self.ifTopicScanning, 1)
+	defer atomic.StoreInt32(&self.ifTopicScanning, 0)
 	atomic.StoreInt32(&self.ifTopicChanged, 0)
-	rsp, err := self.client.Get(self.topicRoot, true, true)
+	rsp, err := self.client.GetNewest(self.topicRoot, true, true)
 	if err != nil {
 		atomic.StoreInt32(&self.ifTopicChanged, 1)
 		if client.IsKeyNotFound(err) {
@@ -431,9 +442,13 @@ func (self *NsqLookupdEtcdMgr) scanTopics() ([]TopicPartitionMetaInfo, error) {
 		return nil, err
 	}
 
-	topicMetaMap := make(map[string]*TopicMetaInfo)
-	topicReplicasMap := make(map[string]map[string]TopicPartitionReplicaInfo)
-	self.processTopicNode(rsp.Node.Nodes, topicMetaMap, topicReplicasMap)
+	topicMetaMap := make(map[string]TopicMetaInfo)
+	topicReplicasMap := make(map[string]map[int]TopicPartitionReplicaInfo)
+	err = self.processTopicNode(rsp.Node.Nodes, topicMetaMap, topicReplicasMap)
+	if err != nil {
+		atomic.StoreInt32(&self.ifTopicChanged, 1)
+		return nil, err
+	}
 
 	topicMetaInfos := make([]TopicPartitionMetaInfo, 0)
 	for k, v := range topicReplicasMap {
@@ -442,14 +457,11 @@ func (self *NsqLookupdEtcdMgr) scanTopics() ([]TopicPartitionMetaInfo, error) {
 			continue
 		}
 		for k2, v2 := range v {
-			partition, err := strconv.Atoi(k2)
-			if err != nil {
-				continue
-			}
+			partition := k2
 			var topicInfo TopicPartitionMetaInfo
 			topicInfo.Name = k
 			topicInfo.Partition = partition
-			topicInfo.TopicMetaInfo = *topicMeta
+			topicInfo.TopicMetaInfo = topicMeta
 			topicInfo.TopicPartitionReplicaInfo = v2
 			topicMetaInfos = append(topicMetaInfos, topicInfo)
 		}
@@ -458,15 +470,21 @@ func (self *NsqLookupdEtcdMgr) scanTopics() ([]TopicPartitionMetaInfo, error) {
 	self.tmiMutex.Lock()
 	self.topicMetaInfos = topicMetaInfos
 	self.topicMetaMap = topicMetaMap
+	self.topicReplicasMap = topicReplicasMap
 	self.tmiMutex.Unlock()
 
 	return topicMetaInfos, nil
 }
 
-func (self *NsqLookupdEtcdMgr) processTopicNode(nodes client.Nodes, topicMetaMap map[string]*TopicMetaInfo, topicReplicasMap map[string]map[string]TopicPartitionReplicaInfo) {
+func (self *NsqLookupdEtcdMgr) processTopicNode(nodes client.Nodes,
+	topicMetaMap map[string]TopicMetaInfo,
+	topicReplicasMap map[string]map[int]TopicPartitionReplicaInfo) error {
 	for _, node := range nodes {
 		if node.Nodes != nil {
-			self.processTopicNode(node.Nodes, topicMetaMap, topicReplicasMap)
+			err := self.processTopicNode(node.Nodes, topicMetaMap, topicReplicasMap)
+			if err != nil {
+				return err
+			}
 		}
 		if node.Dir {
 			continue
@@ -475,7 +493,8 @@ func (self *NsqLookupdEtcdMgr) processTopicNode(nodes client.Nodes, topicMetaMap
 		if key == NSQ_TOPIC_REPLICA_INFO {
 			var rInfo TopicPartitionReplicaInfo
 			if err := json.Unmarshal([]byte(node.Value), &rInfo); err != nil {
-				continue
+				coordLog.Infof("process topic info: %s failed: %v", node.String(), err.Error())
+				return err
 			}
 			rInfo.Epoch = EpochType(node.ModifiedIndex)
 			keys := strings.Split(node.Key, "/")
@@ -484,19 +503,25 @@ func (self *NsqLookupdEtcdMgr) processTopicNode(nodes client.Nodes, topicMetaMap
 				continue
 			}
 			topicName := keys[keyLen-3]
-			partition := keys[keyLen-2]
+			partStr := keys[keyLen-2]
+			part, err := strconv.Atoi(partStr)
+			if err != nil {
+				coordLog.Infof("process topic info: %s failed: %v", node.String(), err.Error())
+				continue
+			}
 			v, ok := topicReplicasMap[topicName]
 			if ok {
-				v[partition] = rInfo
+				v[part] = rInfo
 			} else {
-				pMap := make(map[string]TopicPartitionReplicaInfo)
-				pMap[partition] = rInfo
+				pMap := make(map[int]TopicPartitionReplicaInfo)
+				pMap[part] = rInfo
 				topicReplicasMap[topicName] = pMap
 			}
 		} else if key == NSQ_TOPIC_META {
 			var mInfo TopicMetaInfo
 			if err := json.Unmarshal([]byte(node.Value), &mInfo); err != nil {
-				continue
+				coordLog.Infof("process topic info: %s failed: %v", node.String(), err.Error())
+				return err
 			}
 			keys := strings.Split(node.Key, "/")
 			keyLen := len(keys)
@@ -504,51 +529,50 @@ func (self *NsqLookupdEtcdMgr) processTopicNode(nodes client.Nodes, topicMetaMap
 				continue
 			}
 			topicName := keys[keyLen-2]
-			topicMetaMap[topicName] = &mInfo
+			topicMetaMap[topicName] = mInfo
 		}
 	}
+	return nil
 }
 
 func (self *NsqLookupdEtcdMgr) GetTopicInfo(topic string, partition int) (*TopicPartitionMetaInfo, error) {
 	var topicInfo TopicPartitionMetaInfo
-	self.tmiMutex.Lock()
-	metaInfo, ok := self.topicMetaMap[topic]
-	if !ok {
-		rsp, err := self.client.Get(self.createTopicMetaPath(topic), false, false)
+	metaInfo, err := self.GetTopicMetaInfoTryCache(topic)
+	if err != nil {
+		return nil, err
+	}
+
+	topicInfo.TopicMetaInfo = metaInfo
+	var rInfo TopicPartitionReplicaInfo
+	cached := false
+	// try get cache first
+	if self.isCacheNewest() {
+		self.tmiMutex.RLock()
+		parts, ok := self.topicReplicasMap[topic]
+		if ok {
+			p, ok := parts[partition]
+			if ok {
+				rInfo = p
+				cached = true
+			}
+		}
+		self.tmiMutex.RUnlock()
+	}
+	if !cached {
+		rsp, err := self.client.GetNewest(self.createTopicReplicaInfoPath(topic, partition), false, false)
 		if err != nil {
-			self.tmiMutex.Unlock()
 			if client.IsKeyNotFound(err) {
-				atomic.StoreInt32(&self.ifTopicChanged, 1)
 				return nil, ErrKeyNotFound
 			}
 			return nil, err
 		}
-		var mInfo TopicMetaInfo
-		err = json.Unmarshal([]byte(rsp.Node.Value), &mInfo)
-		if err != nil {
-			self.tmiMutex.Unlock()
-
+		if err = json.Unmarshal([]byte(rsp.Node.Value), &rInfo); err != nil {
 			return nil, err
 		}
-		self.topicMetaMap[topic] = &mInfo
-		metaInfo = &mInfo
+		// no cached, but in the etcd, something changed
+		atomic.StoreInt32(&self.ifTopicChanged, 1)
+		rInfo.Epoch = EpochType(rsp.Node.ModifiedIndex)
 	}
-	self.tmiMutex.Unlock()
-
-	topicInfo.TopicMetaInfo = *metaInfo
-	rsp, err := self.client.Get(self.createTopicReplicaInfoPath(topic, partition), false, false)
-	if err != nil {
-		if client.IsKeyNotFound(err) {
-			atomic.StoreInt32(&self.ifTopicChanged, 1)
-			return nil, ErrKeyNotFound
-		}
-		return nil, err
-	}
-	var rInfo TopicPartitionReplicaInfo
-	if err = json.Unmarshal([]byte(rsp.Node.Value), &rInfo); err != nil {
-		return nil, err
-	}
-	rInfo.Epoch = EpochType(rsp.Node.ModifiedIndex)
 	topicInfo.TopicPartitionReplicaInfo = rInfo
 	topicInfo.Name = topic
 	topicInfo.Partition = partition
@@ -563,30 +587,6 @@ func (self *NsqLookupdEtcdMgr) CreateTopicPartition(topic string, partition int)
 			return ErrKeyAlreadyExist
 		}
 		return err
-	}
-	// if replica == 1, no need watch leader session
-	self.tmiMutex.Lock()
-	v, ok := self.topicMetaMap[topic]
-	if ok {
-		if v.Replica == 1 {
-			self.tmiMutex.Unlock()
-			return nil
-		}
-	}
-	self.tmiMutex.Unlock()
-
-	// start to watch topic leader session
-	watchTopicLeaderInfo := &WatchTopicLeaderInfo{
-		event:       EVENT_WATCH_TOPIC_L_CREATE,
-		topic:       topic,
-		partition:   partition,
-		watchStopCh: make(chan bool, 1),
-		stoppedCh:   make(chan bool, 1),
-	}
-	select {
-	case self.watchTopicLeaderEventChan <- watchTopicLeaderInfo:
-	default:
-		return nil
 	}
 	return nil
 }
@@ -605,7 +605,7 @@ func (self *NsqLookupdEtcdMgr) CreateTopic(topic string, meta *TopicMetaInfo) er
 	}
 
 	self.tmiMutex.Lock()
-	self.topicMetaMap[topic] = meta
+	self.topicMetaMap[topic] = *meta
 	self.tmiMutex.Unlock()
 
 	return nil
@@ -635,9 +635,29 @@ func (self *NsqLookupdEtcdMgr) IsExistTopicPartition(topic string, partitionNum 
 	return true, nil
 }
 
+func (self *NsqLookupdEtcdMgr) GetTopicMetaInfoTryCache(topic string) (TopicMetaInfo, error) {
+	var metaInfo TopicMetaInfo
+	var ok bool
+	if self.isCacheNewest() {
+		self.tmiMutex.RLock()
+		metaInfo, ok = self.topicMetaMap[topic]
+		self.tmiMutex.RUnlock()
+	}
+	if ok {
+		return metaInfo, nil
+	}
+
+	mInfo, _, err := self.GetTopicMetaInfo(topic)
+	if err != nil {
+		return metaInfo, err
+	}
+	atomic.StoreInt32(&self.ifTopicChanged, 1)
+	return mInfo, nil
+}
+
 func (self *NsqLookupdEtcdMgr) GetTopicMetaInfo(topic string) (TopicMetaInfo, EpochType, error) {
 	var metaInfo TopicMetaInfo
-	rsp, err := self.client.Get(self.createTopicMetaPath(topic), false, false)
+	rsp, err := self.client.GetNewest(self.createTopicMetaPath(topic), false, false)
 	if err != nil {
 		if client.IsKeyNotFound(err) {
 			return metaInfo, 0, ErrKeyNotFound
@@ -673,7 +693,7 @@ func (self *NsqLookupdEtcdMgr) UpdateTopicMetaInfo(topic string, meta *TopicMeta
 		atomic.StoreInt32(&self.ifTopicChanged, 1)
 		return err
 	}
-	self.topicMetaMap[topic] = &newMeta
+	self.topicMetaMap[topic] = newMeta
 	atomic.StoreInt32(&self.ifTopicChanged, 1)
 
 	return nil
@@ -695,18 +715,6 @@ func (self *NsqLookupdEtcdMgr) DeleteTopic(topic string, partition int) error {
 			return err
 		}
 	}
-	// stop watch topic leader and delete
-	topicLeaderSession := self.createTopicLeaderSessionPath(topic, partition)
-
-	self.wtliMutex.Lock()
-	defer self.wtliMutex.Unlock()
-	v, ok := self.watchTopicLeaderChanMap[topicLeaderSession]
-	if ok {
-		close(v.watchStopCh)
-		<-v.stoppedCh
-		delete(self.watchTopicLeaderChanMap, topicLeaderSession)
-	}
-
 	return nil
 }
 
@@ -777,119 +785,6 @@ func (self *NsqLookupdEtcdMgr) ReleaseTopicLeader(topic string, partition int, s
 		coordLog.Infof("try release topic leader session [%s] success: %v", topicKey, session)
 	}
 	return err
-}
-
-// maybe use: go WatchTopicLeader()...
-func (self *NsqLookupdEtcdMgr) WatchTopicLeader(leader chan *TopicLeaderSession, stop chan struct{}) error {
-	// start watch goroutine
-	self.wtliMutex.Lock()
-	for _, v := range self.watchTopicLeaderChanMap {
-		go self.watchTopicLeaderSession(v, leader)
-	}
-	self.wtliMutex.Unlock()
-
-	for {
-		select {
-		case event := <-self.watchTopicLeaderEventChan:
-			topicLeaderSession := self.createTopicLeaderSessionPath(event.topic, event.partition)
-			if event.event == EVENT_WATCH_TOPIC_L_CREATE {
-				// add to watch topic leader map
-				self.wtliMutex.Lock()
-				self.watchTopicLeaderChanMap[topicLeaderSession] = event
-				self.wtliMutex.Unlock()
-				coordLog.Infof("create topic[%s] partition[%d] and start watch.", event.topic, event.partition)
-				go self.watchTopicLeaderSession(event, leader)
-			}
-		case <-stop:
-			self.wtliMutex.Lock()
-			for _, v := range self.watchTopicLeaderChanMap {
-				v.watchStopCh <- true
-				<-v.stoppedCh
-			}
-			self.wtliMutex.Unlock()
-			close(leader)
-			return nil
-		case <-self.watchTopicLeaderStopCh:
-			self.wtliMutex.Lock()
-			for _, v := range self.watchTopicLeaderChanMap {
-				v.watchStopCh <- true
-				<-v.stoppedCh
-			}
-			self.wtliMutex.Unlock()
-			close(leader)
-			return nil
-		}
-	}
-}
-
-func (self *NsqLookupdEtcdMgr) watchTopicLeaderSession(watchTopicLeaderInfo *WatchTopicLeaderInfo, leader chan *TopicLeaderSession) {
-	topicLeaderSessionPath := self.createTopicLeaderSessionPath(watchTopicLeaderInfo.topic, watchTopicLeaderInfo.partition)
-	watcher := self.client.Watch(topicLeaderSessionPath, 0, true)
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-watchTopicLeaderInfo.watchStopCh:
-			cancel()
-		}
-	}()
-	for {
-		rsp, err := watcher.Next(ctx)
-		if err != nil {
-			if err == context.Canceled {
-				coordLog.Infof("watch key[%s] canceled.", topicLeaderSessionPath)
-				watchTopicLeaderInfo.stoppedCh <- true
-				return
-			} else {
-				coordLog.Errorf("watcher key[%s] error: %s", topicLeaderSessionPath, err.Error())
-				//rewatch
-				if IsEtcdWatchExpired(err) {
-					rsp, err = self.client.Get(topicLeaderSessionPath, false, true)
-					if err != nil {
-						coordLog.Errorf("rewatch and get key[%s] error: %s", topicLeaderSessionPath, err.Error())
-						time.Sleep(time.Second)
-						continue
-					}
-					watcher = self.client.Watch(topicLeaderSessionPath, rsp.Index+1, true)
-					// watch changed since the expired event happened
-				} else {
-					time.Sleep(5 * time.Second)
-					continue
-				}
-			}
-		}
-		if rsp == nil || rsp.Node == nil {
-			continue
-		}
-		if rsp.PrevNode == nil {
-			coordLog.Infof("watch key[%s] action[%s] value[%s] modified[%d]", rsp.Node.Key, rsp.Action, rsp.Node.Value, rsp.Node.ModifiedIndex)
-		} else {
-			coordLog.Debugf("watch key[%s] action[%s] value[%s] pre_modified[%d] modified[%d]", rsp.Node.Key, rsp.Action, rsp.Node.Value, rsp.PrevNode.ModifiedIndex, rsp.Node.ModifiedIndex)
-		}
-		if rsp.Action == "compareAndDelete" || rsp.Action == "delete" || rsp.Action == "expire" {
-			keys := strings.Split(rsp.Node.Key, "/")
-			keyLen := len(keys)
-			if keyLen < 3 {
-				continue
-			}
-			partition, err := strconv.Atoi(keys[keyLen-2])
-			if err != nil {
-				continue
-			}
-			coordLog.Infof("topic[%s] partition[%d] action[%s] leader deleted.", keys[keyLen-3], partition, rsp.Action)
-			topicLeaderSession := &TopicLeaderSession{
-				Topic:     keys[keyLen-3],
-				Partition: partition,
-			}
-			leader <- topicLeaderSession
-		} else if rsp.Action == "create" {
-			var topicLeaderSession TopicLeaderSession
-			if err := json.Unmarshal([]byte(rsp.Node.Value), &topicLeaderSession); err != nil {
-				continue
-			}
-			coordLog.Infof("topicLeaderSession[%v] create.", topicLeaderSession)
-			leader <- &topicLeaderSession
-		}
-	}
 }
 
 func (self *NsqLookupdEtcdMgr) createClusterPath() string {

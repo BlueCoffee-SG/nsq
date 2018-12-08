@@ -80,9 +80,14 @@ type PubInfo struct {
 type PubInfoChan chan *PubInfo
 
 type ChannelMetaInfo struct {
-	Name    string `json:"name"`
-	Paused  bool   `json:"paused"`
-	Skipped bool   `json:"skipped"`
+	Name           string `json:"name"`
+	Paused         bool   `json:"paused"`
+	Skipped        bool   `json:"skipped"`
+	ZanTestSkipped bool   `json:"zanTestSkipped"`
+}
+
+func (cm *ChannelMetaInfo) IsZanTestSkipepd() bool {
+	return cm.ZanTestSkipped
 }
 
 type Topic struct {
@@ -142,11 +147,11 @@ func GetTopicFullName(topic string, part int) string {
 func NewTopic(topicName string, part int, opt *Options,
 	writeDisabled int32,
 	notify INsqdNotify, loopFunc func(v *Topic)) *Topic {
-	return NewTopicWithExt(topicName, part, false, opt, writeDisabled, notify, loopFunc)
+	return NewTopicWithExt(topicName, part, false, false, opt, writeDisabled, notify, loopFunc)
 }
 
 // Topic constructor
-func NewTopicWithExt(topicName string, part int, ext bool, opt *Options,
+func NewTopicWithExt(topicName string, part int, ext bool, ordered bool, opt *Options,
 	writeDisabled int32,
 	notify INsqdNotify, loopFunc func(v *Topic)) *Topic {
 	if part > MAX_TOPIC_PARTITION {
@@ -168,6 +173,9 @@ func NewTopicWithExt(topicName string, part int, ext bool, opt *Options,
 	}
 	if ext {
 		t.setExt()
+	}
+	if ordered {
+		atomic.StoreInt32(&t.isOrdered, 1)
 	}
 	if t.dynamicConf.SyncEvery < 1 {
 		t.dynamicConf.SyncEvery = 1
@@ -436,6 +444,10 @@ func (t *Topic) LoadChannelMeta() error {
 		if ch.Skipped {
 			channel.Skip()
 		}
+		//skip zan test message according to meta file
+		if ch.IsZanTestSkipepd() {
+			channel.SkipZanTest()
+		} //else nothing maybe unskip
 	}
 	return nil
 }
@@ -447,9 +459,10 @@ func (t *Topic) GetChannelMeta() []ChannelMetaInfo {
 		channel.RLock()
 		if !channel.ephemeral {
 			meta := ChannelMetaInfo{
-				Name:    channel.name,
-				Paused:  channel.IsPaused(),
-				Skipped: channel.IsSkipped(),
+				Name:           channel.name,
+				Paused:         channel.IsPaused(),
+				Skipped:        channel.IsSkipped(),
+				ZanTestSkipped: channel.IsZanTestSkipped(),
 			}
 			channels = append(channels, meta)
 		}
@@ -467,9 +480,10 @@ func (t *Topic) SaveChannelMeta() error {
 		channel.RLock()
 		if !channel.ephemeral {
 			meta := &ChannelMetaInfo{
-				Name:    channel.name,
-				Paused:  channel.IsPaused(),
-				Skipped: channel.IsSkipped(),
+				Name:           channel.name,
+				Paused:         channel.IsPaused(),
+				Skipped:        channel.IsSkipped(),
+				ZanTestSkipped: channel.IsZanTestSkipped(),
 			}
 			channels = append(channels, meta)
 		}
@@ -636,7 +650,8 @@ func (t *Topic) SetDynamicInfo(dynamicConf TopicDynamicConf, idGen MsgIDGenerato
 	nsqLog.Logf("topic dynamic configure changed to %v", dynamicConf)
 	t.channelLock.RLock()
 	for _, ch := range t.channelMap {
-		ch.SetExt(dynamicConf.Ext)
+		ext := dynamicConf.Ext
+		ch.SetExt(ext)
 	}
 	t.channelLock.RUnlock()
 	t.Unlock()
@@ -719,7 +734,7 @@ func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
 			ext = 0
 		}
 		start := t.backend.GetQueueReadStart()
-		channel = NewChannel(t.GetTopicName(), t.GetTopicPart(), channelName, readEnd,
+		channel = NewChannel(t.GetTopicName(), t.GetTopicPart(), t.IsOrdered(), channelName, readEnd,
 			t.option, deleteCallback, t.flushForChannelMoreData, atomic.LoadInt32(&t.writeDisabled),
 			t.nsqdNotify, ext, start)
 
@@ -1225,7 +1240,7 @@ func (t *Topic) ForceFlush() {
 	s = time.Now()
 	t.channelLock.RLock()
 	for _, channel := range t.channelMap {
-		channel.flush()
+		channel.Flush()
 	}
 	t.channelLock.RUnlock()
 	cost = time.Now().Sub(s)

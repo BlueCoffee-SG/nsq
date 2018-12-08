@@ -946,7 +946,7 @@ func (self *NsqdCoordinator) SetChannelConsumeOffsetToCluster(ch *nsqd.Channel, 
 	return nil
 }
 
-func (self *NsqdCoordinator) UpdateChannelStateToCluster(channel *nsqd.Channel, paused int, skipped int) error {
+func (self *NsqdCoordinator) UpdateChannelStateToCluster(channel *nsqd.Channel, paused int, skipped int, zanTestSkipped int) error {
 	topicName := channel.GetTopicName()
 	partition := channel.GetTopicPart()
 	coord, checkErr := self.getTopicCoord(topicName, partition)
@@ -978,6 +978,19 @@ func (self *NsqdCoordinator) UpdateChannelStateToCluster(channel *nsqd.Channel, 
 			coordLog.Warningf("update channel(%v) state skip:%v failed: %v, topic %v,%v", channel.GetName(), skipped, pauseErr, topicName, partition)
 			return &CoordErr{pauseErr.Error(), RpcNoErr, CoordLocalErr}
 		}
+
+		var zanTestSkippedErr error
+		switch zanTestSkipped {
+		case nsqd.ZanTestSkip:
+			zanTestSkippedErr = channel.SkipZanTest()
+		case nsqd.ZanTestUnskip:
+			zanTestSkippedErr = channel.UnskipZanTest()
+		}
+		if zanTestSkippedErr != nil {
+			coordLog.Warningf("update channel(%v) state skip zan test :%v failed: %v, topic %v,%v", channel.GetName(), zanTestSkipped, pauseErr, topicName, partition)
+			return &CoordErr{zanTestSkippedErr.Error(), RpcNoErr, CoordLocalErr}
+		}
+
 		return nil
 	}
 	doLocalExit := func(err *CoordErr) {}
@@ -991,7 +1004,7 @@ func (self *NsqdCoordinator) UpdateChannelStateToCluster(channel *nsqd.Channel, 
 	}
 	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *CoordErr {
 		var rpcErr *CoordErr
-		rpcErr = c.UpdateChannelState(&tcData.topicLeaderSession, &tcData.topicInfo, channel.GetName(), paused, skipped)
+		rpcErr = c.UpdateChannelState(&tcData.topicLeaderSession, &tcData.topicInfo, channel.GetName(), paused, skipped, zanTestSkipped)
 		if rpcErr != nil {
 			coordLog.Infof("sync channel(%v) state pause:%v, skip:%v to replica %v failed: %v, topic %v,%v", channel.GetName(), paused, skipped, nodeID, rpcErr, topicName, partition)
 		}
@@ -1075,7 +1088,7 @@ func (self *NsqdCoordinator) FinishMessageToCluster(channel *nsqd.Channel, clien
 			rpcErr = c.UpdateChannelOffset(&tcData.topicLeaderSession, &tcData.topicInfo, channel.GetName(), syncOffset)
 		} else {
 			if delayedMsg {
-				cursorList, cntList, channelCntList := channel.GetDelayedQueueConsumedState()
+				cursorList, cntList, channelCntList := channel.GetDelayedQueueConsumedDetails()
 				rpcErr = c.UpdateDelayedQueueState(&tcData.topicLeaderSession, &tcData.topicInfo,
 					channel.GetName(), cursorList, cntList, channelCntList, false)
 			} else {
@@ -1103,7 +1116,7 @@ func (self *NsqdCoordinator) FinishMessageToCluster(channel *nsqd.Channel, clien
 	return nil
 }
 
-func (self *NsqdCoordinator) updateChannelStateOnSlave(tc *coordData, channelName string, paused int, skipped int) *CoordErr {
+func (self *NsqdCoordinator) updateChannelStateOnSlave(tc *coordData, channelName string, paused int, skipped int, zanTestSkipped int) *CoordErr {
 	topicName := tc.topicInfo.Name
 	partition := tc.topicInfo.Partition
 
@@ -1161,6 +1174,19 @@ func (self *NsqdCoordinator) updateChannelStateOnSlave(tc *coordData, channelNam
 		coordLog.Errorf("fail to skip/unskip %v, channel: %v, %v", skipped, topic.GetTopicName(), channelName)
 		return ErrLocalChannelSkipFailed
 	}
+
+	var zanTestSkipErr error
+	switch zanTestSkipped {
+	case nsqd.ZanTestSkip:
+		zanTestSkipErr = ch.SkipZanTest()
+	case nsqd.ZanTestUnskip:
+		zanTestSkipErr = ch.UnskipZanTest()
+	}
+	if zanTestSkipErr != nil {
+		coordLog.Errorf("fail to skip/unskip zan test %v, channel: %v, %v", zanTestSkipped, topic.GetTopicName(), channelName)
+		return ErrLocalChannelSkipZanTestFailed
+	}
+
 	topic.SaveChannelMeta()
 	return nil
 }
@@ -1262,7 +1288,8 @@ func (self *NsqdCoordinator) DeleteChannel(topic *nsqd.Topic, channelName string
 	doLocalWrite := func(d *coordData) *CoordErr {
 		localErr := topic.DeleteExistingChannel(channelName)
 		if localErr != nil {
-			coordLog.Infof("deleteing local channel %v error: %v", channelName, localErr)
+			coordLog.Infof("topic %v deleteing local channel %v error: %v",
+				topicName, channelName, localErr)
 		} else {
 			topic.SaveChannelMeta()
 		}
@@ -1280,11 +1307,12 @@ func (self *NsqdCoordinator) DeleteChannel(topic *nsqd.Topic, channelName string
 	doSlaveSync := func(c *NsqdRpcClient, nodeID string, tcData *coordData) *CoordErr {
 		rpcErr := c.DeleteChannel(&tcData.topicLeaderSession, &tcData.topicInfo, channelName)
 		if rpcErr != nil {
-			coordLog.Infof("delete channel(%v) to replica %v failed: %v", channelName,
+			coordLog.Infof("topic %v delete channel(%v) to replica %v failed: %v",
+				topicName, channelName,
 				nodeID, rpcErr)
 		}
-		// ignore delete channel error
-		return nil
+		// make sure delete channel will retry until success
+		return rpcErr
 	}
 	handleSyncResult := func(successNum int, tcData *coordData) bool {
 		// we can ignore the error if this channel is not ordered. (just sync next time)
@@ -1309,7 +1337,7 @@ func (self *NsqdCoordinator) deleteChannelOnSlave(tc *coordData, channelName str
 		return ErrTopicWriteOnNonISR
 	}
 
-	coordLog.Logf("got delete channel(%v) offset on slave ", channelName)
+	coordLog.Logf("topic %v got delete channel(%v) on slave ", topicName, channelName)
 	topic, localErr := self.localNsqd.GetExistingTopic(topicName, partition)
 	if localErr != nil {
 		coordLog.Warningf("slave missing topic : %v", topicName)
@@ -1318,7 +1346,7 @@ func (self *NsqdCoordinator) deleteChannelOnSlave(tc *coordData, channelName str
 
 	localErr = topic.DeleteExistingChannel(channelName)
 	if localErr != nil {
-		coordLog.Logf("delete channel %v on slave failed: %v ", channelName, localErr)
+		coordLog.Logf("topic %v delete channel %v on slave failed: %v ", topicName, channelName, localErr)
 	} else {
 		topic.SaveChannelMeta()
 	}
@@ -1361,7 +1389,7 @@ func (self *NsqdCoordinator) EmptyChannelDelayedStateToCluster(channel *nsqd.Cha
 			return nil
 		}
 		var rpcErr *CoordErr
-		cursorList, cntList, channelCntList := channel.GetDelayedQueueConsumedState()
+		cursorList, cntList, channelCntList := channel.GetDelayedQueueConsumedDetails()
 		rpcErr = c.UpdateDelayedQueueState(&tcData.topicLeaderSession, &tcData.topicInfo,
 			channel.GetName(), cursorList, cntList, channelCntList, true)
 		if rpcErr != nil {
@@ -1428,7 +1456,7 @@ func (self *NsqdCoordinator) updateChannelListOnSlave(tc *coordData, chList []st
 			delete(oldChList, chName)
 		}
 		changed := false
-		for chName := range oldChList {
+		for chName, _ := range oldChList {
 			coordLog.Infof("topic %v local channel not on leader: %v", topicName, chName)
 			topic.CloseExistingChannel(chName, false)
 			changed = true

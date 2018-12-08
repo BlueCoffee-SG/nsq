@@ -128,6 +128,11 @@ func (h *IntHeap) Pop() interface{} {
 	return x
 }
 
+type WrapChannelConsumerOffset struct {
+	Name string
+	ChannelConsumerOffset
+}
+
 type NodeTopicStats struct {
 	NodeID string
 	// the data (MB) need to be consumed on the leader for all channels in the topic.
@@ -142,6 +147,7 @@ type NodeTopicStats struct {
 	ChannelNum             map[string]int
 	ChannelList            map[string][]string
 	ChannelMetas           map[string][]nsqd.ChannelMetaInfo
+	ChannelOffsets         map[string][]WrapChannelConsumerOffset
 }
 
 func NewNodeTopicStats(nid string, cap int, cpus int) *NodeTopicStats {
@@ -154,6 +160,7 @@ func NewNodeTopicStats(nid string, cap int, cpus int) *NodeTopicStats {
 		ChannelNum:             make(map[string]int, cap),
 		ChannelList:            make(map[string][]string),
 		ChannelMetas:           make(map[string][]nsqd.ChannelMetaInfo),
+		ChannelOffsets:         make(map[string][]WrapChannelConsumerOffset),
 		NodeCPUs:               cpus,
 	}
 }
@@ -486,7 +493,7 @@ func (self *DataPlacement) SetBalanceInterval(start int, end int) {
 
 func (self *DataPlacement) DoBalance(monitorChan chan struct{}) {
 	//check period for the data balance.
-	ticker := time.NewTicker(time.Minute * 10)
+	ticker := time.NewTicker(time.Minute)
 	defer func() {
 		ticker.Stop()
 		coordLog.Infof("balance check exit.")

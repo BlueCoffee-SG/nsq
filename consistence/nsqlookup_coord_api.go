@@ -24,16 +24,19 @@ func (self *NsqLookupCoordinator) GetLookupLeader() NsqLookupdNodeInfo {
 }
 
 func (self *NsqLookupCoordinator) GetTopicMetaInfo(topicName string) (TopicMetaInfo, error) {
-	meta, _, err := self.leadership.GetTopicMetaInfo(topicName)
+	meta, err := self.leadership.GetTopicMetaInfoTryCache(topicName)
+	if err != nil {
+		return TopicMetaInfo{}, err
+	}
 	return meta, err
 }
 
-func (self *NsqLookupCoordinator) GetTopicsMetaInfoMap(topics []string) (map[string]*TopicMetaInfo, error) {
+func (self *NsqLookupCoordinator) GetTopicsMetaInfoMap(topics []string) (map[string]TopicMetaInfo, error) {
 	return self.leadership.GetTopicsMetaInfoMap(topics)
 }
 
 func (self *NsqLookupCoordinator) GetTopicLeaderNodes(topicName string) (map[string]string, error) {
-	meta, _, err := self.leadership.GetTopicMetaInfo(topicName)
+	meta, err := self.leadership.GetTopicMetaInfoTryCache(topicName)
 	if err != nil {
 		coordLog.Infof("failed to get topic %v meta: %v", topicName, err)
 		return nil, err

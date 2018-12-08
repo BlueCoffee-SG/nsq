@@ -367,7 +367,7 @@ func (s *httpServer) doLookup(w http.ResponseWriter, req *http.Request, ps httpr
 				}
 			}
 			if len(registrations) > 0 {
-				nsqlookupLog.Logf("no topic producers found in memory, found in cluster: %v, %v", len(clusterNodes), len(registrations))
+				nsqlookupLog.Logf("no topic %v producers found in memory, found in cluster: %v, %v", topicName, len(clusterNodes), len(registrations))
 			}
 		}
 	}
@@ -452,6 +452,7 @@ func (s *httpServer) doLookup(w http.ResponseWriter, req *http.Request, ps httpr
 				"partition_num":  meta.PartitionNum,
 				"replica":        meta.Replica,
 				"extend_support": meta.Ext,
+				"ordered":        meta.OrderedMulti,
 			},
 			"producers":  peers,
 			"partitions": partitionProducers,

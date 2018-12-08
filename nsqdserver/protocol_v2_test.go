@@ -51,7 +51,10 @@ func identify(t *testing.T, conn io.ReadWriter, extra map[string]interface{}, f 
 	test.Equal(t, err, nil)
 	frameType, data, err := nsq.UnpackResponse(resp)
 	test.Equal(t, err, nil)
-	test.Equal(t, frameType, f)
+	if frameType != f {
+		t.Errorf("identify err: %v", string(data))
+	}
+	test.Equal(t, f, frameType)
 	return data
 }
 
@@ -768,6 +771,79 @@ func TestConsumeTagMessageNormal(t *testing.T) {
 	_, exist := topic.GetChannel("ch").GetClientTagMsgChan(tagName)
 	//assert chan cnt
 	test.Equal(t, false, exist)
+}
+
+func TestConsumeIllegalZanTestWithCompatibility(t *testing.T) {
+	topicName := "test_zan_test_illegal" + strconv.Itoa(int(time.Now().Unix()))
+
+	opts := nsqdNs.NewOptions()
+	opts.Logger = newTestLogger(t)
+	if testing.Verbose() {
+		opts.LogLevel = 4
+		nsqdNs.SetLogger(opts.Logger)
+	}
+	tcpAddr, _, nsqd, nsqdServer := mustStartNSQD(opts)
+	defer os.RemoveAll(opts.DataPath)
+	defer nsqdServer.Exit()
+	topic := nsqd.GetTopicIgnPart(topicName)
+	topicDynConf := nsqdNs.TopicDynamicConf{
+		AutoCommit: 1,
+		SyncEvery:  1,
+	}
+	topic.SetDynamicInfo(topicDynConf, nil)
+
+	topic.GetChannel("ch")
+
+	//subscribe normal client
+	conn1, err := mustConnectNSQD(tcpAddr)
+	test.Equal(t, err, nil)
+	client1Params := make(map[string]interface{})
+	client1Params["client_id"] = "client"
+	client1Params["hostname"] = "client"
+	identify(t, conn1, client1Params, frameTypeResponse)
+	sub(t, conn1, topicName, "ch")
+	_, err = nsq.Ready(1).WriteTo(conn1)
+	test.Equal(t, err, nil)
+
+	jsonHeaderStr := "{\"##client_dispatch_tag\":\"test_tag\",\"##channel_filter_tag\":\"test\",\"zan_test\":\"false\"}"
+	jhe := ext.NewJsonHeaderExt()
+	jhe.SetJsonHeaderBytes([]byte(jsonHeaderStr))
+
+	jsonHeaderZanTestStr := "{\"##client_dispatch_tag\":\"test_tag\",\"##channel_filter_tag\":\"test\",\"zan_test\":true}"
+	jheZantest := ext.NewJsonHeaderExt()
+	jheZantest.SetJsonHeaderBytes([]byte(jsonHeaderZanTestStr))
+
+	conn, err := mustConnectNSQD(tcpAddr)
+	msgBodyZanTest := []byte("test body zan test")
+	msgBody := []byte("test body")
+
+	//case 1: tagged message goes to client with tag
+	for i := 0; i < 10; i++ {
+		if i%2 == 0 {
+			msg := nsqdNs.NewMessageWithExt(0, msgBody, jhe.ExtVersion(), jhe.GetBytes())
+			topic.GetChannel("ch")
+			_, _, _, _, putErr := topic.PutMessage(msg)
+			test.Nil(t, putErr)
+		} else {
+			cmd, err := nsq.PublishWithJsonExt(topicName, "0", msgBodyZanTest, jheZantest.GetBytes())
+			test.Nil(t, err)
+			cmd.WriteTo(conn)
+			resp, _ := nsq.ReadResponse(conn)
+			frameType, data, _ := nsq.UnpackResponse(resp)
+			t.Logf("frameType: %d, data: %s", frameType, data)
+			test.Equal(t, int32(1), frameType)
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		msgOut := recvNextMsgAndCheckExt(t, conn1, len(msgBody), 0, true, false)
+		test.NotNil(t, msgOut)
+		test.Equal(t, uint8(ext.NO_EXT_VER), msgOut.ExtVer)
+	}
+
+	conn1.Close()
+	conn.Close()
+	time.Sleep(1 * time.Second)
 }
 
 func TestConsumeJsonHeaderMessageNormal(t *testing.T) {
@@ -2453,6 +2529,95 @@ func TestTcpPub(t *testing.T) {
 	conn.Close()
 }
 
+func TestTcpMpubExt(t *testing.T) {
+	opts := nsqdNs.NewOptions()
+	opts.Logger = newTestLogger(t)
+	opts.LogLevel = 1
+	opts.MaxMsgSize = 100
+	opts.MaxBodySize = 1000
+	tcpAddr, _, nsqd, nsqdServer := mustStartNSQD(opts)
+	defer os.RemoveAll(opts.DataPath)
+	defer nsqdServer.Exit()
+
+	conn, err := mustConnectNSQD(tcpAddr)
+	test.Equal(t, err, nil)
+
+	topicName := "test_tcp_mpub_ext" + strconv.Itoa(int(time.Now().Unix()))
+	nsqd.GetTopicWithExt(topicName, 0, false).GetChannel("ch")
+
+	identify(t, conn, nil, frameTypeResponse)
+	var msgExtList []*nsq.MsgExt
+	var msgBody [][]byte
+	// PUB ext to non-ext topic
+	for i := 0; i < 10; i++ {
+		if i%2 == 0 {
+			msgExtList = append(msgExtList, &nsq.MsgExt{})
+			msgBody = append(msgBody, []byte("msg has no ext"))
+		} else {
+			msgExtList = append(msgExtList, &nsq.MsgExt{
+				TraceID:     123,
+				DispatchTag: "desiredTag",
+				Custom:      map[string]string{"key1": "val1", "key2": "val2"},
+			})
+			msgBody = append(msgBody, []byte("msg has ext"))
+		}
+	}
+
+	cmd, err := nsq.MultiPublishWithJsonExt(topicName, "0", msgExtList, msgBody)
+	test.Nil(t, err)
+	cmd.WriteTo(conn)
+	resp, _ := nsq.ReadResponse(conn)
+	frameType, data, _ := nsq.UnpackResponse(resp)
+	t.Logf("frameType: %d, data: %s", frameType, data)
+	test.Equal(t, frameType, frameTypeResponse)
+	test.Equal(t, len(data), 2)
+	test.Equal(t, data[:], []byte("OK"))
+	conn.Close()
+
+	conn, err = mustConnectNSQD(tcpAddr)
+	identify(t, conn, map[string]interface{}{"extend_support": true}, frameTypeResponse)
+	test.Equal(t, err, nil)
+	sub(t, conn, topicName, "ch")
+	_, err = nsq.Ready(1).WriteTo(conn)
+	test.Equal(t, err, nil)
+	isOdd := false
+	cnt := 0
+	for {
+		resp, _ := nsq.ReadResponse(conn)
+		frameType, data, err := nsq.UnpackResponse(resp)
+		test.Nil(t, err)
+		test.NotEqual(t, frameTypeError, frameType)
+		if frameType == frameTypeResponse {
+			t.Logf("got response data: %v", string(data))
+			continue
+		}
+		msgOut, err := nsq.DecodeMessageWithExt(data, true)
+		//test.Equal(t, 5, len(msgOut.Body))
+		if !isOdd {
+			test.Equal(t, uint8(ext.JSON_HEADER_EXT_VER), msgOut.ExtVer)
+			var extMap map[string]interface{}
+			err := json.Unmarshal(msgOut.ExtBytes, &extMap)
+			test.Nil(t, err)
+			test.Assert(t, len(extMap) == 0, "extMap size is not 0: %v", extMap)
+		} else {
+			test.Equal(t, uint8(ext.JSON_HEADER_EXT_VER), msgOut.ExtVer)
+			var extMap map[string]interface{}
+			err := json.Unmarshal(msgOut.ExtBytes, &extMap)
+			test.Nil(t, err)
+			test.Assert(t, extMap["key1"] == "val1", "ext json kv invalid %v", extMap["key1"])
+			test.Assert(t, extMap["key2"] == "val2", "ext json kv invalid %v", extMap["key2"])
+
+		}
+		isOdd = !isOdd
+		_, err = nsq.Finish(msgOut.ID).WriteTo(conn)
+		test.Nil(t, err)
+		if cnt++; cnt == 10 {
+			break
+		}
+	}
+	conn.Close()
+}
+
 func TestTcpPubExtToNonExtTopic(t *testing.T) {
 	testTcpPubExtToNonExtTopic(t, true)
 }
@@ -3288,6 +3453,93 @@ func TestSizeLimits(t *testing.T) {
 	test.Equal(t, string(data), fmt.Sprintf("E_BAD_MESSAGE MPUB message too big 101 > 100"))
 }
 
+func TestZanTestSkip(t *testing.T) {
+	opts := nsqdNs.NewOptions()
+	opts.Logger = newTestLogger(t)
+	opts.LogLevel = 1
+	opts.SyncEvery = 1
+	opts.MsgTimeout = time.Second * 2
+	opts.MaxReqTimeout = time.Second * 100
+	opts.AllowZanTestSkip = true
+	tcpAddr, _, nsqd, nsqdServer := mustStartNSQD(opts)
+	defer os.RemoveAll(opts.DataPath)
+	defer nsqdServer.Exit()
+
+	conn, err := mustConnectNSQD(tcpAddr)
+	test.Equal(t, err, nil)
+	defer conn.Close()
+
+	//send messages, zan_test and normal combined
+	topicName := "test_zan_test_skip" + strconv.Itoa(int(time.Now().Unix()))
+	ch := nsqd.GetTopicWithExt(topicName, 0, false).GetChannel("ch")
+
+	identify(t, conn, nil, frameTypeResponse)
+	var msgExtList []*nsq.MsgExt
+	var msgBody [][]byte
+	// PUB ext to non-ext topic
+	for i := 0; i < 10; i++ {
+		if i%2 == 0 {
+			msgExtList = append(msgExtList, &nsq.MsgExt{
+				Custom: map[string]string{"key1": "val1", "key2": "val2"},
+			})
+			msgBody = append(msgBody, []byte("msg has no zan_test ext"))
+		} else {
+			msgExtList = append(msgExtList, &nsq.MsgExt{
+				TraceID:     123,
+				DispatchTag: "desiredTag",
+				Custom:      map[string]string{"zan_test": "true", "key1": "val1"},
+			})
+			msgBody = append(msgBody, []byte("msg has zan_test ext"))
+		}
+	}
+
+	cmd, err := nsq.MultiPublishWithJsonExt(topicName, "0", msgExtList, msgBody)
+	test.Nil(t, err)
+	cmd.WriteTo(conn)
+	resp, _ := nsq.ReadResponse(conn)
+	frameType, data, _ := nsq.UnpackResponse(resp)
+	t.Logf("frameType: %d, data: %s", frameType, data)
+	test.Equal(t, frameType, frameTypeResponse)
+	test.Equal(t, len(data), 2)
+	test.Equal(t, data[:], []byte("OK"))
+	conn.Close()
+
+	//skip zan test messages
+	ch.SkipZanTest()
+	//consume&validate zan_test messages
+	conn, err = mustConnectNSQD(tcpAddr)
+	identify(t, conn, map[string]interface{}{"extend_support": true}, frameTypeResponse)
+	test.Equal(t, err, nil)
+	sub(t, conn, topicName, "ch")
+	_, err = nsq.Ready(10).WriteTo(conn)
+	test.Equal(t, err, nil)
+	var cnt int
+	for {
+		resp, _ := nsq.ReadResponse(conn)
+		frameType, data, err := nsq.UnpackResponse(resp)
+		test.Nil(t, err)
+		test.NotEqual(t, frameTypeError, frameType)
+		if frameType == frameTypeResponse {
+			t.Logf("got response data: %v", string(data))
+			continue
+		}
+		msgOut, err := nsq.DecodeMessageWithExt(data, true)
+		//test.Equal(t, 5, len(msgOut.Body))
+
+		test.Equal(t, uint8(ext.JSON_HEADER_EXT_VER), msgOut.ExtVer)
+		var extMap map[string]interface{}
+		err = json.Unmarshal(msgOut.ExtBytes, &extMap)
+		test.Nil(t, err)
+		test.Assert(t, extMap["zan_test"] == nil, "json ext header should not contains zan_test:%v", extMap)
+		_, err = nsq.Finish(msgOut.ID).WriteTo(conn)
+		test.Nil(t, err)
+		if cnt++; cnt == 5 {
+			break
+		}
+	}
+	conn.Close()
+}
+
 func TestDelayMessage(t *testing.T) {
 	opts := nsqdNs.NewOptions()
 	opts.Logger = newTestLogger(t)
@@ -3308,7 +3560,9 @@ func TestDelayMessage(t *testing.T) {
 	topic := nsqd.GetTopicIgnPart(topicName)
 	topic.GetChannel("ch")
 
-	identify(t, conn, nil, frameTypeResponse)
+	identify(t, conn, map[string]interface{}{
+		"output_buffer_timeout": 10,
+	}, frameTypeResponse)
 	sub(t, conn, topicName, "ch")
 	time.Sleep(opts.QueueScanRefreshInterval)
 
@@ -3424,7 +3678,9 @@ func TestDelayMessageToQueueEnd(t *testing.T) {
 	topic := nsqd.GetTopicIgnPart(topicName)
 	topic.GetChannel("ch")
 
-	identify(t, conn, nil, frameTypeResponse)
+	identify(t, conn, map[string]interface{}{
+		"output_buffer_timeout": 10,
+	}, frameTypeResponse)
 	sub(t, conn, topicName, "ch")
 	time.Sleep(opts.QueueScanRefreshInterval)
 
@@ -3545,13 +3801,137 @@ func TestDelayMessageToQueueEnd(t *testing.T) {
 	t.Log(delayDone)
 	t.Logf("delay should be: %v", longestDelay)
 	test.Equal(t, delayDone >= longestDelay, true)
-	test.Equal(t, delayDone < longestDelay+opts.MsgTimeout+5*opts.QueueScanInterval, true)
+	test.Equal(t, delayDone < longestDelay+opts.MsgTimeout*2+5*opts.QueueScanInterval, true)
 	test.Equal(t, true, int(msgClientOut.Attempts) > reqToEndAttempts)
 
 	t.Logf("put %v,  fin : %v, recv: %v", putCnt, finCnt, recvCnt)
 	test.Equal(t, true, putCnt <= finCnt)
 	test.Equal(t, true, recvCnt-finCnt > 10)
 	time.Sleep(time.Second)
+}
+
+func TestDelayMessageToQueueEndAgainAndAgain(t *testing.T) {
+	// this would test the req of delayed queue message and
+	// other delayed queue message can be poped to consumer
+	// make sure delayed message will not be blocked too long time if some
+	// of them req again and again
+
+	// note: the delayed message will be peeked in batch with MaxWaitingDelayed size
+	// so we need test MaxWaitingDelayed req for delayed messages and to see if MaxWaitingDelayed + 1
+	// message can be peeked to consumer
+
+	opts := nsqdNs.NewOptions()
+	opts.Logger = newTestLogger(t)
+	opts.LogLevel = 2
+	if testing.Verbose() {
+		opts.LogLevel = 3
+	}
+	nsqdNs.SetLogger(opts.Logger)
+	opts.SyncEvery = 1
+	opts.QueueScanInterval = time.Millisecond * 10
+	opts.MsgTimeout = time.Second * 10
+	opts.MaxReqTimeout = time.Second * 100
+	opts.MaxConfirmWin = 50
+	opts.ReqToEndThreshold = time.Millisecond * 400
+	tcpAddr, _, nsqd, nsqdServer := mustStartNSQD(opts)
+
+	defer os.RemoveAll(opts.DataPath)
+	defer nsqdServer.Exit()
+
+	conn, err := mustConnectNSQD(tcpAddr)
+	test.Equal(t, err, nil)
+	defer conn.Close()
+
+	topicName := "test_req_delay_again" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopicIgnPart(topicName)
+	topic.GetChannel("ch")
+
+	identify(t, conn, map[string]interface{}{
+		"output_buffer_timeout": 10,
+	}, frameTypeResponse)
+
+	sub(t, conn, topicName, "ch")
+	time.Sleep(opts.QueueScanRefreshInterval)
+	_, err = nsq.Ready(nsqdNs.MaxWaitingDelayed).WriteTo(conn)
+	test.Equal(t, err, nil)
+
+	putCnt := 0
+	recvCnt := 0
+	finCnt := 0
+
+	for i := 0; i < nsqdNs.MaxWaitingDelayed*2; i++ {
+		msg := nsqdNs.NewMessage(0, []byte("test body"+strconv.Itoa(i+1)))
+		msg.TraceID = uint64(i + 1)
+		topic.PutMessage(msg)
+		putCnt++
+	}
+	topic.ForceFlush()
+
+	delayStart := time.Now()
+	delayToEnd := opts.ReqToEndThreshold * time.Duration(11+int(opts.MaxConfirmWin))
+	// delay all messages to the delayed queue
+	for i := 0; i < nsqdNs.MaxWaitingDelayed*2; i++ {
+		msgOut := recvNextMsgAndCheckClientMsg(t, conn, 0, 0, false)
+		recvCnt++
+		_, err = nsq.Requeue(nsq.MessageID(msgOut.GetFullMsgID()), delayToEnd).WriteTo(conn)
+		test.Nil(t, err)
+		t.Logf("delay msg to end %v, %v", msgOut.ID, recvCnt)
+	}
+	delayStart2 := time.Now()
+	// delay some delayed message again
+	for {
+		msgOut := recvNextMsgAndCheckClientMsg(t, conn, 0, 0, false)
+		recvCnt++
+		delayDone := time.Since(delayStart)
+		t.Logf("===== recv msg %v, %v, delayed: %v", msgOut.ID, recvCnt, delayDone)
+		test.Assert(t, delayDone > delayToEnd, "should delay enough")
+		if delayDone > delayToEnd*2 {
+			t.Errorf("timeout for waiting finish other messages: %v", delayDone)
+			break
+		}
+		delayDone = time.Since(delayStart2)
+		if uint64(nsq.GetNewMessageID(msgOut.ID[:])) <= uint64(nsqdNs.MaxWaitingDelayed) {
+			t.Logf("delay msg short: %v, %v", msgOut.ID, delayDone)
+			test.Assert(t, delayDone < delayToEnd+opts.ReqToEndThreshold*4, "should not delay too long time")
+			_, err = nsq.Requeue(nsq.MessageID(msgOut.GetFullMsgID()), opts.ReqToEndThreshold-time.Millisecond).WriteTo(conn)
+			test.Nil(t, err)
+			test.Assert(t, msgOut.Attempts < 5, "delayed again messages should attemp less")
+			continue
+		}
+		t.Logf("fin msg: %v, delayed: %v", msgOut.ID, delayDone)
+		nsq.Finish(msgOut.ID).WriteTo(conn)
+		test.Assert(t, delayDone < delayToEnd+opts.ReqToEndThreshold*4, "should not delay too long time")
+		finCnt++
+		test.Equal(t, uint16(2), msgOut.Attempts)
+		if finCnt >= nsqdNs.MaxWaitingDelayed {
+			break
+		}
+	}
+
+	t.Logf("recv %v, put:%v, fincnt: %v", recvCnt, putCnt, finCnt)
+	test.Assert(t, finCnt >= nsqdNs.MaxWaitingDelayed, "should consume other delayed messages")
+	test.Assert(t, recvCnt > putCnt+putCnt/2, "recv should larger than put")
+	test.Assert(t, recvCnt < putCnt*2+finCnt, "recv should less than 2*put+fin")
+	delayStart = time.Now()
+	for finCnt < putCnt {
+		msgClientOut := recvNextMsgAndCheckClientMsg(t, conn, 0, 0, false)
+		recvCnt++
+		t.Logf("recv msg %v, %v", msgClientOut.ID, recvCnt)
+
+		delayDone := time.Since(delayStart)
+		t.Logf("delayed: %v", delayDone)
+		test.Assert(t, delayDone < opts.ReqToEndThreshold*4, "should not delay too long time")
+
+		finCnt++
+		t.Logf("fin msg: %v", msgClientOut.ID)
+		nsq.Finish(msgClientOut.ID).WriteTo(conn)
+	}
+
+	t.Logf("put %v,  fin : %v, recv: %v", putCnt, finCnt, recvCnt)
+	test.Equal(t, true, putCnt <= finCnt)
+	test.Equal(t, true, putCnt+10 > finCnt)
+	test.Equal(t, true, recvCnt-finCnt > putCnt/2)
+	test.Equal(t, true, recvCnt < putCnt*3)
 }
 
 func TestDelayManyMessagesToQueueEndWithLeaderChanged(t *testing.T) {
@@ -3567,7 +3947,7 @@ func testDelayManyMessagesToQueueEnd(t *testing.T, changedLeader bool) {
 	opts.Logger = newTestLogger(t)
 	opts.LogLevel = 1
 	if testing.Verbose() {
-		opts.LogLevel = 5
+		opts.LogLevel = 4
 		nsqdNs.SetLogger(opts.Logger)
 	}
 	opts.SyncEvery = 1
@@ -3576,7 +3956,7 @@ func testDelayManyMessagesToQueueEnd(t *testing.T, changedLeader bool) {
 	opts.MaxConfirmWin = 50
 	opts.ReqToEndThreshold = nsqdNs.MaxWaitingDelayed*time.Millisecond*100 + time.Millisecond*800
 	opts.MaxReqTimeout = time.Second*30 + opts.ReqToEndThreshold*3
-	opts.MaxOutputBufferTimeout = time.Millisecond
+	opts.MaxOutputBufferTimeout = 10 * time.Millisecond
 	tcpAddr, _, nsqd, nsqdServer := mustStartNSQD(opts)
 
 	defer os.RemoveAll(opts.DataPath)
@@ -3621,7 +4001,7 @@ func testDelayManyMessagesToQueueEnd(t *testing.T, changedLeader bool) {
 			defer conn.Close()
 			conn.(*net.TCPConn).SetNoDelay(true)
 			identify(t, conn, map[string]interface{}{
-				"output_buffer_timeout": opts.MaxOutputBufferTimeout / time.Millisecond,
+				"output_buffer_timeout": 10,
 			}, frameTypeResponse)
 			subRsp, err := subWaitResp(t, conn, topicName, "ch")
 			if changedLeader {
@@ -3992,6 +4372,52 @@ func TestSubOrderedWithFilter(t *testing.T) {
 		msgOut := recvNextMsgAndCheckExt(t, conn, 0, msg.TraceID, true, true)
 		msgOut.Body = msgOut.Body[12:]
 		test.Equal(t, msgOut.Body, []byte("second"))
+	}
+}
+
+func TestSubWithLargeReady(t *testing.T) {
+	opts := nsqdNs.NewOptions()
+	opts.Logger = newTestLogger(t)
+	if testing.Verbose() {
+		opts.LogLevel = 2
+		nsqdNs.SetLogger(opts.Logger)
+	}
+	tcpAddr, _, nsqd, nsqdServer := mustStartNSQD(opts)
+	defer os.RemoveAll(opts.DataPath)
+	defer nsqdServer.Exit()
+
+	topicName := "test_large_rdy_count" + strconv.Itoa(int(time.Now().Unix()))
+
+	conn, err := mustConnectNSQD(tcpAddr)
+	test.Equal(t, err, nil)
+
+	topic := nsqd.GetTopicIgnPart(topicName)
+	topic.GetChannel("ch")
+	msg := nsqdNs.NewMessage(0, []byte("test body"))
+	topic.PutMessage(msg)
+
+	for i := 0; i < 100000; i++ {
+		topic.PutMessage(nsqdNs.NewMessage(0, []byte("test body")))
+	}
+
+	identify(t, conn, nil, frameTypeResponse)
+	sub(t, conn, topicName, "ch")
+
+	defer conn.Close()
+
+	_, err = nsq.Ready(2500).WriteTo(conn)
+	test.Equal(t, err, nil)
+
+	_, err = nsq.Ready(int(opts.MaxRdyCount)).WriteTo(conn)
+	test.Equal(t, err, nil)
+
+	for i := 0; i < 100000; i++ {
+		msgOut := recvNextMsgAndCheckClientMsg(t, conn, len(msg.Body), 0, false)
+		_, err = nsq.Finish(msgOut.ID).WriteTo(conn)
+		if err != nil {
+			t.Logf("fin error: %v", err.Error())
+		}
+		test.Nil(t, err)
 	}
 }
 
@@ -5025,7 +5451,7 @@ func TestTimeoutShouldNotBlockStats(t *testing.T) {
 		}
 
 		if len(stats) == 0 {
-			t.Errorf("should  not emtpy: %v", time.Since(b))
+			t.Errorf("should  not empty: %v", time.Since(b))
 			break
 		}
 		t.Logf("block at %v : %v", time.Now(), time.Since(b))
@@ -5599,7 +6025,7 @@ func benchmarkProtocolV2PubWithArg(b *testing.B, size int, single bool) {
 		batch[i] = msg
 	}
 	topicName := "bench_v2_pub" + strconv.Itoa(int(time.Now().Unix()))
-	testTopic := nsqd.GetTopic(topicName, 0)
+	testTopic := nsqd.GetTopic(topicName, 0, false)
 
 	b.SetBytes(int64(len(msg)))
 	b.StartTimer()

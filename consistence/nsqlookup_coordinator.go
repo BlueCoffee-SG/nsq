@@ -215,6 +215,7 @@ func (self *NsqLookupCoordinator) handleLeadership() {
 			self.nsqdMonitorChan = nil
 		}
 	}()
+	ticker := time.NewTicker(time.Second * 5)
 	for {
 		select {
 		case l, ok := <-lookupdLeaderChan:
@@ -242,6 +243,12 @@ func (self *NsqLookupCoordinator) handleLeadership() {
 			if self.leaderNode.GetID() == "" {
 				coordLog.Warningln("leader is missing.")
 			}
+		case <-ticker.C:
+			// reload topics to cache, used for query from client
+			_, err := self.leadership.ScanTopics()
+			if err != nil {
+				coordLog.Warningf("refresh topics failed: %v", err.Error())
+			}
 		}
 	}
 }
@@ -261,19 +268,6 @@ func (self *NsqLookupCoordinator) notifyLeaderChanged(monitorChan chan struct{})
 		return
 	}
 	coordLog.Infof("I am master now.")
-	// reload topic information
-	if self.leadership != nil {
-		newTopics, err := self.leadership.ScanTopics()
-		if err != nil {
-			// may not init any topic yet.
-			if err != ErrKeyNotFound {
-				coordLog.Infof("load topic info failed: %v", err)
-			}
-		} else {
-			coordLog.Infof("topic loaded : %v", len(newTopics))
-			self.notifyTopicsToAllNsqdForReload(newTopics)
-		}
-	}
 
 	// we do not need to watch each topic leader,
 	// we can make sure the leader on the alive node is alive.
@@ -292,13 +286,29 @@ func (self *NsqLookupCoordinator) notifyLeaderChanged(monitorChan chan struct{})
 	self.wg.Add(1)
 	go func() {
 		defer self.wg.Done()
-		self.checkTopics(monitorChan)
+		self.rpcFailRetryFunc(monitorChan)
 	}()
+
+	// reload topic information should after watching the nsqd nodes
+	if self.leadership != nil {
+		newTopics, err := self.leadership.ScanTopics()
+		if err != nil {
+			// may not init any topic yet.
+			if err != ErrKeyNotFound {
+				coordLog.Infof("load topic info failed: %v", err)
+			}
+		} else {
+			coordLog.Infof("topic loaded : %v", len(newTopics))
+			self.notifyTopicsToAllNsqdForReload(newTopics)
+		}
+	}
+
 	self.wg.Add(1)
 	go func() {
 		defer self.wg.Done()
-		self.rpcFailRetryFunc(monitorChan)
+		self.checkTopics(monitorChan)
 	}()
+
 	self.wg.Add(1)
 	go func() {
 		defer self.wg.Done()
@@ -667,7 +677,7 @@ func (self *NsqLookupCoordinator) doCheckTopics(monitorChan chan struct{}, faile
 				continue
 			}
 			coordLog.Warningf("topic %v partitions not enough : %v, %v", name, pnum, metaNum)
-			self.CreateTopic(name, *meta)
+			self.CreateTopic(name, meta)
 		}
 	} else {
 		var err error

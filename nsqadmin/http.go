@@ -18,11 +18,15 @@ import (
 	"bytes"
 	"sort"
 
+	"sync"
+
 	"github.com/julienschmidt/httprouter"
 	"github.com/youzan/nsq/internal/clusterinfo"
 	"github.com/youzan/nsq/internal/http_api"
 	"github.com/youzan/nsq/internal/protocol"
 	"github.com/youzan/nsq/internal/version"
+	"golang.org/x/net/context"
+	"golang.org/x/sync/semaphore"
 )
 
 func maybeWarnMsg(msgs []string) string {
@@ -104,6 +108,7 @@ func NewHTTPServer(ctx *Context) *httpServer {
 	router.Handle("POST", "/api/topics", http_api.Decorate(s.createTopicChannelHandler, s.authCheck, log, http_api.V1))
 	router.Handle("POST", "/api/topics/:topic", http_api.Decorate(s.topicActionHandler, s.authCheck, log, http_api.V1))
 	router.Handle("POST", "/api/topics/:topic/:channel", http_api.Decorate(s.channelActionHandler, s.authCheck, log, http_api.V1))
+	router.Handle("POST", "/api/topics/:topic/:channel/admin", http_api.Decorate(s.channelAdminActionHandler, s.adminCheck, log, http_api.V1))
 	router.Handle("POST", "/api/topics/:topic/:channel/client", http_api.Decorate(s.channelClientActionHandler, s.authCheck, log, http_api.V1))
 	router.Handle("DELETE", "/api/nodes/:node", http_api.Decorate(s.tombstoneNodeForTopicHandler, s.adminCheck, log, http_api.V1))
 	router.Handle("DELETE", "/api/topics/:topic", http_api.Decorate(s.deleteTopicHandler, s.adminCheck, log, http_api.V1))
@@ -200,37 +205,64 @@ func (s *httpServer) pingHandler(w http.ResponseWriter, req *http.Request, ps ht
 	return "OK", nil
 }
 
+type DCLookupdAddrs struct {
+	DC           string   `json:"dc"`
+	LookupdAddrs []string `json:"lookupAddrs"`
+}
+
+func transform2DCLookupdAddrs(dcLookupdAddrs map[string][]string) []*DCLookupdAddrs {
+	dcLookupdAddrsList := make([]*DCLookupdAddrs, 0)
+	for dc, _ := range dcLookupdAddrs {
+		dcLookupdAddrsList = append(dcLookupdAddrsList, &DCLookupdAddrs{dc, dcLookupdAddrs[dc]})
+	}
+	return dcLookupdAddrsList
+}
+
 func (s *httpServer) indexHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	asset, _ := Asset("index.html")
-	t, _ := template.New("index").Parse(string(asset))
+	t, _ := template.New("index").Funcs(template.FuncMap{"dcLookupdList": transform2DCLookupdAddrs}).Parse(string(asset))
 
 	w.Header().Set("Content-Type", "text/html")
 	lookupdAddresses := make([]string, 0)
+	//all lookupd addresses from dc
+	dcLookupdAddresses := make(map[string][]string)
 	lookupdAddresseMap := make(map[string]bool)
+	http2DCMap := make(map[string]string)
 	for _, addr := range s.ctx.nsqadmin.opts.NSQDHTTPAddresses {
 		lookupdAddresseMap[addr] = false
 	}
-	lookupdNodes, err := s.ci.ListAllLookupdNodes(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses)
+
+	lookupdNodesDC, err := s.ci.ListAllLookupdNodes(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC)
 	if err != nil {
 		s.ctx.nsqadmin.logf("WARNING: failed to list lookupd nodes : %v", err)
 	} else {
-		s.ctx.nsqadmin.logf("list lookupd found nodes : %v", lookupdNodes)
-		for _, n := range lookupdNodes.AllNodes {
-			addr := net.JoinHostPort(n.NodeIP, n.HttpPort)
-			lookupdAddresseMap[addr] = false
-		}
-		if lookupdNodes.LeaderNode.ID != "" {
-			leaderAddr := net.JoinHostPort(lookupdNodes.LeaderNode.NodeIP, lookupdNodes.LeaderNode.HttpPort)
-			lookupdAddresseMap[leaderAddr] = true
+		s.ctx.nsqadmin.logf("list lookupd found nodes : %v", lookupdNodesDC)
+		for _, lookupdNodes := range lookupdNodesDC {
+			for _, n := range lookupdNodes.AllNodes {
+				addr := net.JoinHostPort(n.NodeIP, n.HttpPort)
+				lookupdAddresseMap[addr] = false
+				http2DCMap[addr] = lookupdNodes.DC
+			}
+			if lookupdNodes.LeaderNode.ID != "" {
+				leaderAddr := net.JoinHostPort(lookupdNodes.LeaderNode.NodeIP, lookupdNodes.LeaderNode.HttpPort)
+				lookupdAddresseMap[leaderAddr] = true
+			}
 		}
 	}
 	for addr, isLeader := range lookupdAddresseMap {
+		if _, exist := dcLookupdAddresses[http2DCMap[addr]]; !exist {
+			dcLookupdAddresses[http2DCMap[addr]] = make([]string, 0)
+		}
+
 		if isLeader {
 			lookupdAddresses = append(lookupdAddresses, addr+" (Leader)")
+			dcLookupdAddresses[http2DCMap[addr]] = append(dcLookupdAddresses[http2DCMap[addr]], addr+" (Leader)")
 		} else {
 			lookupdAddresses = append(lookupdAddresses, addr)
+			dcLookupdAddresses[http2DCMap[addr]] = append(dcLookupdAddresses[http2DCMap[addr]], addr)
 		}
 	}
+	delete(dcLookupdAddresses, "")
 	s.ctx.nsqadmin.logf("total lookupd nodes : %v", lookupdAddresses)
 	u, _ := s.getUserInfo(w, req)
 	//add redirect query to ca auth url
@@ -240,41 +272,47 @@ func (s *httpServer) indexHandler(w http.ResponseWriter, req *http.Request, ps h
 		return nil, http_api.Err{http.StatusInternalServerError, "INTERNAL ERROR"}
 	}
 	t.Execute(w, struct {
-		Version             string
-		ProxyGraphite       bool
-		GraphEnabled        bool
-		GraphiteURL         string
-		StatsdInterval      int
-		UseStatsdPrefixes   bool
-		StatsdCounterFormat string
-		StatsdGaugeFormat   string
-		StatsdPrefix        string
-		NSQLookupd          []string
-		AllNSQLookupds      []string
-		AuthUrl             string
-		LogoutUrl           string
-		Login               bool
-		User                string
-		AuthEnabled         bool
-		HasNotificationEndpoint		bool
+		Version                 string
+		ProxyGraphite           bool
+		GraphEnabled            bool
+		GraphiteURL             string
+		StatsdInterval          int
+		UseStatsdPrefixes       bool
+		StatsdCounterFormat     string
+		StatsdGaugeFormat       string
+		StatsdPrefix            string
+		NSQLookupd              []string
+		DCNSQLookupd            map[string][]string
+		AllNSQLookupds          []string
+		DCAllNSQLookupds        map[string][]string
+		AuthUrl                 string
+		LogoutUrl               string
+		Login                   bool
+		User                    string
+		AuthEnabled             bool
+		HasNotificationEndpoint bool
+		EnableZanTestSkip       bool
 	}{
-		Version:             version.Binary,
-		ProxyGraphite:       s.ctx.nsqadmin.opts.ProxyGraphite,
-		GraphEnabled:        s.ctx.nsqadmin.opts.GraphiteURL != "",
-		GraphiteURL:         s.ctx.nsqadmin.opts.GraphiteURL,
-		StatsdInterval:      int(s.ctx.nsqadmin.opts.StatsdInterval / time.Second),
-		UseStatsdPrefixes:   s.ctx.nsqadmin.opts.UseStatsdPrefixes,
-		StatsdCounterFormat: s.ctx.nsqadmin.opts.StatsdCounterFormat,
-		StatsdGaugeFormat:   s.ctx.nsqadmin.opts.StatsdGaugeFormat,
-		StatsdPrefix:        s.ctx.nsqadmin.opts.StatsdPrefix,
-		NSQLookupd:          s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
-		AllNSQLookupds:      lookupdAddresses,
-		AuthUrl:             authUrl.String(),
-		LogoutUrl:           s.ctx.nsqadmin.opts.LogoutUrl,
-		Login:               (s.ctx.nsqadmin.IsAuthEnabled() && u.IsLogin()) || (!s.ctx.nsqadmin.IsAuthEnabled()),
-		User:                u.GetUserName(),
-		AuthEnabled:         s.ctx.nsqadmin.IsAuthEnabled(),
-		HasNotificationEndpoint:         s.ctx.nsqadmin.opts.NotificationHTTPEndpoint != "",
+		Version:                 version.Binary,
+		ProxyGraphite:           s.ctx.nsqadmin.opts.ProxyGraphite,
+		GraphEnabled:            s.ctx.nsqadmin.opts.GraphiteURL != "",
+		GraphiteURL:             s.ctx.nsqadmin.opts.GraphiteURL,
+		StatsdInterval:          int(s.ctx.nsqadmin.opts.StatsdInterval / time.Second),
+		UseStatsdPrefixes:       s.ctx.nsqadmin.opts.UseStatsdPrefixes,
+		StatsdCounterFormat:     s.ctx.nsqadmin.opts.StatsdCounterFormat,
+		StatsdGaugeFormat:       s.ctx.nsqadmin.opts.StatsdGaugeFormat,
+		StatsdPrefix:            s.ctx.nsqadmin.opts.StatsdPrefix,
+		NSQLookupd:              s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+		DCNSQLookupd:            s.ctx.nsqadmin.DC2LookupAddresses(),
+		AllNSQLookupds:          lookupdAddresses,
+		DCAllNSQLookupds:        dcLookupdAddresses,
+		AuthUrl:                 authUrl.String(),
+		LogoutUrl:               s.ctx.nsqadmin.opts.LogoutUrl,
+		Login:                   (s.ctx.nsqadmin.IsAuthEnabled() && u.IsLogin()) || (!s.ctx.nsqadmin.IsAuthEnabled()),
+		User:                    u.GetUserName(),
+		AuthEnabled:             s.ctx.nsqadmin.IsAuthEnabled(),
+		HasNotificationEndpoint: s.ctx.nsqadmin.opts.NotificationHTTPEndpoint != "",
+		EnableZanTestSkip:       s.ctx.nsqadmin.opts.EnableZanTestSkip,
 	})
 
 	return nil, nil
@@ -320,9 +358,9 @@ func (s *httpServer) topicsHandler(w http.ResponseWriter, req *http.Request, ps 
 	}
 
 	var topics []*clusterinfo.TopicInfo
-	if len(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses) != 0 {
+	if len(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC) > 0 {
 		fetchMetaStr, _ := reqParams.Get("metaInfo")
-		topics, err = s.ci.GetLookupdTopicsMeta(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses, fetchMetaStr == "true")
+		topics, err = s.ci.GetLookupdTopicsMeta(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC, fetchMetaStr == "true")
 	} else {
 		topics, err = s.ci.GetNSQDTopics(s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	}
@@ -338,18 +376,38 @@ func (s *httpServer) topicsHandler(w http.ResponseWriter, req *http.Request, ps 
 
 	inactive, _ := reqParams.Get("inactive")
 	if inactive == "true" {
+		maxWeight := 10
+		if len(topics) < 10 {
+			maxWeight = len(topics)
+		}
+		sem := semaphore.NewWeighted(int64(maxWeight))
+		ctx := context.TODO()
+		var channelMapLock sync.RWMutex
 		topicChannelMap := make(map[string][]string)
-		if len(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses) == 0 {
+		if len(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC) == 0 {
 			goto respond
 		}
+
 		for _, topic := range topics {
-			producers, _, _ := s.ci.GetLookupdTopicProducers(
-				topic.TopicName, s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses)
-			if len(producers) == 0 {
-				topicChannels, _ := s.ci.GetLookupdTopicChannels(
-					topic.TopicName, s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses)
-				topicChannelMap[topic.TopicName] = topicChannels
+			if err := sem.Acquire(ctx, 1); err != nil {
+				s.ctx.nsqadmin.logf("ERROR: failed to get semapher - %s", err)
+				break
 			}
+			go func() {
+				defer sem.Release(1)
+				producers, _, _ := s.ci.GetLookupdTopicProducers(
+					topic.TopicName, s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC)
+				if len(producers) == 0 {
+					topicChannels, _ := s.ci.GetLookupdTopicChannels(
+						topic.TopicName, s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC)
+					channelMapLock.Lock()
+					topicChannelMap[topic.TopicName] = topicChannels
+					channelMapLock.Unlock()
+				}
+			}()
+		}
+		if err := sem.Acquire(ctx, int64(maxWeight)); err != nil {
+			s.ctx.nsqadmin.logf("Failed to acquire semaphore: %v", err)
 		}
 	respond:
 		return struct {
@@ -366,7 +424,7 @@ func (s *httpServer) topicsHandler(w http.ResponseWriter, req *http.Request, ps 
 
 func (s *httpServer) lookupNodesHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	var messages []string
-	nodes, err := s.ci.ListAllLookupdNodes(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses)
+	nodesDC, err := s.ci.ListAllLookupdNodes(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
 		if !ok {
@@ -378,8 +436,9 @@ func (s *httpServer) lookupNodesHandler(w http.ResponseWriter, req *http.Request
 	}
 	return struct {
 		*clusterinfo.LookupdNodes
-		Message string `json:"message"`
-	}{nodes, maybeWarnMsg(messages)}, nil
+		LookupdNodesDC []*clusterinfo.LookupdNodes `json:"lookupd_nodes_dc"`
+		Message        string                      `json:"message"`
+	}{nodesDC[0], nodesDC, maybeWarnMsg(messages)}, nil
 }
 
 func (s *httpServer) coordinatorHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
@@ -390,7 +449,7 @@ func (s *httpServer) coordinatorHandler(w http.ResponseWriter, req *http.Request
 	node := ps.ByName("node")
 
 	producers, _, err := s.ci.GetTopicProducers(topicName,
-		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 		s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
@@ -425,7 +484,7 @@ func (s *httpServer) topicHandler(w http.ResponseWriter, req *http.Request, ps h
 	topicName := ps.ByName("topic")
 
 	producers, _, err := s.ci.GetTopicProducers(topicName,
-		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 		s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
@@ -509,7 +568,7 @@ func (s *httpServer) channelHandler(w http.ResponseWriter, req *http.Request, ps
 	channelName := ps.ByName("channel")
 
 	producers, _, err := s.ci.GetTopicProducers(topicName,
-		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 		s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
@@ -547,7 +606,7 @@ func (s *httpServer) channelHandler(w http.ResponseWriter, req *http.Request, ps
 func (s *httpServer) nodesHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	var messages []string
 
-	producers, err := s.ci.GetProducers(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses, s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
+	producers, err := s.ci.GetProducers(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC, s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
 		if !ok {
@@ -569,7 +628,7 @@ func (s *httpServer) nodeHandler(w http.ResponseWriter, req *http.Request, ps ht
 
 	node := ps.ByName("node")
 
-	producers, err := s.ci.GetProducers(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses, s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
+	producers, err := s.ci.GetProducers(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC, s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
 		if !ok {
@@ -633,7 +692,7 @@ func (s *httpServer) tombstoneNodeForTopicHandler(w http.ResponseWriter, req *ht
 	}
 
 	err = s.ci.TombstoneNodeForTopic(body.Topic, node,
-		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses)
+		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
 		if !ok {
@@ -678,13 +737,14 @@ func (s *httpServer) searchMessageTrace(w http.ResponseWriter, req *http.Request
 		return nil, http_api.Err{400, "TRACE service url is not configured"}
 	}
 	var queryParam struct {
-		Topic     string `json:"topic"`
-		Partition string `json:"partition_id"`
-		Channel   string `json:"channel"`
-		MsgID     string `json:"msgid"`
-		TraceID   string `json:"traceid"`
-		Hours     string `json:"hours"`
-		IsHashed  bool   `json:"ishashed"`
+		Topic     string   `json:"topic"`
+		Partition string   `json:"partition_id"`
+		Channel   string   `json:"channel"`
+		MsgID     string   `json:"msgid"`
+		TraceID   string   `json:"traceid"`
+		Hours     string   `json:"hours"`
+		IsHashed  bool     `json:"ishashed"`
+		DC        []string `json:"dc"`
 	}
 	err := json.NewDecoder(req.Body).Decode(&queryParam)
 	if err != nil {
@@ -694,7 +754,14 @@ func (s *httpServer) searchMessageTrace(w http.ResponseWriter, req *http.Request
 	if !protocol.IsValidTopicName(queryParam.Topic) {
 		return nil, http_api.Err{400, "INVALID_TOPIC"}
 	}
-
+	dcChecked := make(map[string]bool)
+	if len(queryParam.DC) > 0 {
+		for _, dc := range queryParam.DC {
+			dcChecked[dc] = true
+		}
+	} else if len(s.ctx.nsqadmin.opts.DCNSQLookupdHTTPAddresses) > 0 {
+		return nil, http_api.Err{400, "AT_LEAST_ONE_DC_NEEDED"}
+	}
 	filters := make(IndexFieldsQuery, 0)
 	reqParams, err := http_api.NewReqParams(req)
 	if err != nil {
@@ -785,10 +852,14 @@ func (s *httpServer) searchMessageTrace(w http.ResponseWriter, req *http.Request
 		return nil, http_api.Err{400, "topic should not be empty to search message"}
 	}
 
-	_, partitionProducers, _ := s.ci.GetTopicProducers(topicName, s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+	_, partitionProducers, _ := s.ci.GetTopicProducers(topicName, s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 		s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	needGetRequestMsg := true
+	maxWeight := int64(10)
+	ctx := context.TODO()
+	sem := semaphore.NewWeighted(maxWeight)
 	for index, m := range resultList.LogDataDtos {
+		idx := index
 		items := make([]TraceLogItemInfo, 0)
 		extraJsonStr, _ := strconv.Unquote(m.Extra)
 		err := json.Unmarshal([]byte(extraJsonStr), &items)
@@ -800,7 +871,11 @@ func (s *httpServer) searchMessageTrace(w http.ResponseWriter, req *http.Request
 				extraJsonStr, _ := strconv.Unquote(m.Extra1)
 				err = json.Unmarshal([]byte(extraJsonStr), &items)
 				if err != nil || len(items) == 0 {
-					continue
+					s.ctx.nsqadmin.logf("msg extra1 invalid: %v, %v", m.Extra1, err)
+					err = json.Unmarshal([]byte(m.Extra1), &items)
+					if err != nil || len(items) == 0 {
+						continue
+					}
 				}
 			}
 		}
@@ -808,24 +883,59 @@ func (s *httpServer) searchMessageTrace(w http.ResponseWriter, req *http.Request
 		if queryParam.Channel != "" && item.Channel != queryParam.Channel {
 			continue
 		}
-		resultList.LogDataDtos[index].TraceLogItemInfo = item
+		resultList.LogDataDtos[idx].TraceLogItemInfo = item
 		pid := GetPartitionFromMsgID(int64(item.MsgID))
 		if len(partitionProducers[strconv.Itoa(pid)]) == 0 {
 			s.ctx.nsqadmin.logf("partition producer not found: %v", pid)
 			continue
 		}
-		producer := partitionProducers[strconv.Itoa(pid)][0]
+
+		//check dc from trace message host
+		dcPrefix := strings.SplitN(m.HostName, "-", 2)[0]
+		if _, exist := dcChecked[dcPrefix]; len(dcChecked) > 0 && !exist {
+			//set msg id to 0 to prevent adding to logDataFilterEmpty after current loop
+			resultList.LogDataDtos[idx].TraceLogItemInfo.MsgID = 0
+			continue
+		}
 
 		if int64(item.MsgID) == requestMsgID {
 			needGetRequestMsg = false
 		}
-		msgBody, _, err := s.ci.GetNSQDMessageByID(*producer, item.Topic, strconv.Itoa(pid), int64(item.MsgID))
-		if err != nil {
-			s.ctx.nsqadmin.logf("get msg %v data failed : %v", item, err)
-			continue
+
+		//assign dc to search result
+		producersDC := partitionProducers[strconv.Itoa(pid)]
+		var producersMsgBelong *clusterinfo.Producer
+		for pIdx, p := range producersDC {
+			if p.BroadcastAddress == m.HostIp {
+				resultList.LogDataDtos[idx].DC = p.DC
+				s.ctx.nsqadmin.logf("pass DC %v to msg: %v", p.DC, m.ID)
+				producersMsgBelong = producersDC[pIdx]
+				break
+			}
 		}
-		resultList.LogDataDtos[index].RawMsgData = msgBody
+
+		if err := sem.Acquire(ctx, 1); err != nil {
+			s.ctx.nsqadmin.logf("ERROR: fail to acquire signal - %v", err)
+			warnMessages = append(warnMessages, err.Error())
+			break
+		}
+
+		go func() {
+			defer sem.Release(int64(1))
+			msgBody, _, err := s.ci.GetNSQDMessageByID(*producersMsgBelong, item.Topic, strconv.Itoa(pid), int64(item.MsgID))
+			if err != nil {
+				s.ctx.nsqadmin.logf("get msg %v data failed : %v", item, err)
+			} else {
+				resultList.LogDataDtos[idx].RawMsgData = msgBody
+			}
+		}()
 	}
+
+	if err := sem.Acquire(ctx, maxWeight); err != nil {
+		s.ctx.nsqadmin.logf("ERROR: fail to acquire signal - %v", err)
+		warnMessages = append(warnMessages, err.Error())
+	}
+
 	//s.ctx.nsqadmin.logf("get msg trace data : %v", resultList.LogDataDtos)
 	logDataFilterEmpty := make(TLListT, 0, len(resultList.LogDataDtos))
 	for _, v := range resultList.LogDataDtos {
@@ -841,39 +951,61 @@ func (s *httpServer) searchMessageTrace(w http.ResponseWriter, req *http.Request
 		var jsv TraceLogDataForJs
 		jsv.TraceLogItemInfoForJs = v.ToJsJson()
 		jsv.RawMsgData = v.RawMsgData
+		jsv.DC = v.DC
 		logDataForJs = append(logDataForJs, jsv)
 	}
 	//s.ctx.nsqadmin.logf("sorted msg trace data : %v", logDataFilterEmpty)
 	var requestMsg string
+	requestMsgDC := make(map[string]string)
 	if needGetRequestMsg && requestMsgID > 0 {
 		pid := GetPartitionFromMsgID(int64(requestMsgID))
 		if len(partitionProducers[strconv.Itoa(pid)]) == 0 {
 			s.ctx.nsqadmin.logf("partition producer not found: %v", pid)
 		} else {
-			producer := partitionProducers[strconv.Itoa(pid)][0]
-			msgBody, _, err := s.ci.GetNSQDMessageByID(*producer, topicName, strconv.Itoa(pid), requestMsgID)
-			if err != nil {
-				s.ctx.nsqadmin.logf("get msg %v data failed : %v", requestMsgID, err)
-				warnMessages = append(warnMessages, err.Error())
-			} else {
-				requestMsg = msgBody
-				var buf bytes.Buffer
-				err := json.Indent(&buf, []byte(msgBody), "", "  ")
-				if err == nil {
-					requestMsg = buf.String()
+			//loop through partitionProducers in multi dc context
+			producersDC := partitionProducers[strconv.Itoa(pid)]
+			hasMultiDC := len(producersDC) > 1
+			for _, producer := range producersDC {
+				if _, exist := dcChecked[producer.DC]; len(dcChecked) > 0 && !exist {
+					continue
+				}
+
+				msgBody, _, err := s.ci.GetNSQDMessageByID(*producer, topicName, strconv.Itoa(pid), requestMsgID)
+				if err != nil {
+					s.ctx.nsqadmin.logf("get msg %v data failed : %v", requestMsgID, err)
+					warnMessages = append(warnMessages, err.Error())
 				} else {
-					s.ctx.nsqadmin.logf("pretty json failed : %v", err)
+					if hasMultiDC {
+						requestMsgDC[producer.DC] = msgBody
+						var buf bytes.Buffer
+						err := json.Indent(&buf, []byte(msgBody), "", "  ")
+						if err == nil {
+							requestMsgDC[producer.DC] = buf.String()
+						} else {
+							s.ctx.nsqadmin.logf("pretty json failed : %v", err)
+						}
+					} else {
+						requestMsg = msgBody
+						var buf bytes.Buffer
+						err := json.Indent(&buf, []byte(msgBody), "", "  ")
+						if err == nil {
+							requestMsg = buf.String()
+						} else {
+							s.ctx.nsqadmin.logf("pretty json failed : %v", err)
+						}
+					}
 				}
 			}
 		}
 	}
 
 	return struct {
-		LogDataDtos []TraceLogDataForJs `json:"logDataDtos"`
-		TotalCount  int                 `json:"totalCount"`
-		RequestMsg  string              `json:"request_msg"`
-		Message     string              `json:"message"`
-	}{logDataForJs, resultList.TotalCount, requestMsg, maybeWarnMsg(warnMessages)}, nil
+		LogDataDtos  []TraceLogDataForJs `json:"logDataDtos"`
+		TotalCount   int                 `json:"totalCount"`
+		RequestMsg   string              `json:"request_msg"`
+		RequestMsgDC map[string]string   `json:"request_msg_dc"`
+		Message      string              `json:"message"`
+	}{logDataForJs, resultList.TotalCount, requestMsg, requestMsgDC, maybeWarnMsg(warnMessages)}, nil
 }
 
 func (s *httpServer) createTopicChannelHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
@@ -920,7 +1052,8 @@ func (s *httpServer) createTopicChannelHandler(w http.ResponseWriter, req *http.
 	syncDisk, _ := strconv.Atoi(body.SyncDisk)
 	err = s.ci.CreateTopic(body.Topic, pnum, replica,
 		syncDisk, body.RetentionDays, body.OrderedMulti, body.Ext,
-		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses)
+		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC)
+
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
 		if !ok {
@@ -937,8 +1070,10 @@ func (s *httpServer) createTopicChannelHandler(w http.ResponseWriter, req *http.
 		go func() {
 			retry := s.ctx.nsqadmin.opts.ChannelCreationRetry
 			for i := 0; i < retry; i++ {
-				err := s.ci.CreateTopicChannelAfterTopicCreation(body.Topic, body.Channel,
-					s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses, pnum)
+				var err error
+				err = s.ci.CreateTopicChannelAfterTopicCreation(body.Topic, body.Channel,
+					s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC, pnum)
+
 				if err == nil {
 					s.notifyAdminActionWithUser("create_channel", body.Topic, body.Channel, "", req)
 					s.ctx.nsqadmin.logf("channel created.")
@@ -960,11 +1095,11 @@ func (s *httpServer) createTopicChannelHandler(w http.ResponseWriter, req *http.
 
 func (s *httpServer) deleteTopicHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	var messages []string
-
+	var err error
 	topicName := ps.ByName("topic")
 
-	err := s.ci.DeleteTopic(topicName,
-		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+	err = s.ci.DeleteTopic(topicName,
+		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 		s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
@@ -985,12 +1120,12 @@ func (s *httpServer) deleteTopicHandler(w http.ResponseWriter, req *http.Request
 
 func (s *httpServer) deleteChannelHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	var messages []string
-
+	var err error
 	topicName := ps.ByName("topic")
 	channelName := ps.ByName("channel")
 
-	err := s.ci.DeleteChannel(topicName, channelName,
-		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+	err = s.ci.DeleteChannel(topicName, channelName,
+		s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 		s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
@@ -1026,6 +1161,7 @@ func (s *httpServer) topicChannelClientAction(req *http.Request, topicName strin
 	var body struct {
 		Action    string `json:"action"`
 		Timestamp string `json:"timestamp"`
+		Order     bool   `json:"order"`
 	}
 	err := json.NewDecoder(req.Body).Decode(&body)
 	if err != nil {
@@ -1035,11 +1171,11 @@ func (s *httpServer) topicChannelClientAction(req *http.Request, topicName strin
 	switch body.Action {
 	case "sink":
 		if channelName != "" {
-			s.notifyAdminActionWithUser("sink", topicName, channelName, "", req)
+			s.notifyAdminActionWithUserAndOrder("sink", topicName, channelName, "", body.Order, req)
 		}
 	case "sink_removal":
 		if channelName != "" {
-			s.notifyAdminActionWithUser("sink_removal", topicName, channelName, "", req)
+			s.notifyAdminActionWithUserAndOrder("sink_removal", topicName, channelName, "", body.Order, req)
 
 		}
 	default:
@@ -1067,13 +1203,78 @@ func (s *httpServer) channelActionHandler(w http.ResponseWriter, req *http.Reque
 	return s.topicChannelAction(req, topicName, channelName)
 }
 
+func (s *httpServer) channelAdminActionHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	topicName := ps.ByName("topic")
+	channelName := ps.ByName("channel")
+	return s.topicChannelAdminAction(req, topicName, channelName)
+}
+
+type ChannelActionRequest struct {
+	Action    string `json:"action"`
+	Timestamp string `json:"timestamp"`
+	Node      string `json:"node"`
+	Partition int    `json:"partition"`
+	MsgId     string `json:"msgid"`
+}
+
+func (s *httpServer) topicChannelAdminAction(req *http.Request, topicName string, channelName string) (interface{}, error) {
+	var messages []string
+
+	var body ChannelActionRequest
+	err := json.NewDecoder(req.Body).Decode(&body)
+	if err != nil {
+		return nil, http_api.Err{400, fmt.Sprintf("INVALID_REQUEST: %v", err)}
+	}
+
+	switch body.Action {
+	case "finish":
+		if channelName != "" {
+			//parse dc
+			node := body.Node
+			//parse node and partition
+			if node == "" {
+				return nil, http_api.Err{400, fmt.Sprintf("INVALID_NSQD_NODE")}
+			}
+			partition := body.Partition
+
+			//parse msgId
+			var msgid int64
+			msgid, err = strconv.ParseInt(body.MsgId, 10, 64)
+			if err != nil {
+				return nil, http_api.Err{400, fmt.Sprintf("INVALID_MSGID: %s", err)}
+			}
+			if msgid <= 0 {
+				return nil, http_api.Err{400, fmt.Sprintf("INVALID_MSGID")}
+			}
+			err = s.ci.FinishMessage(topicName, channelName, node, partition, msgid)
+			if err != nil && strings.Contains(err.Error(), "Message ID not in flight") {
+				return nil, http_api.Err{400, fmt.Sprintf("INVALID_MSGID: Message ID not in flight")}
+			}
+			s.notifyAdminActionWithUser("finish_message", topicName, channelName, node, req)
+		}
+	default:
+		return nil, http_api.Err{400, "INVALID_ACTION"}
+	}
+
+	if err != nil {
+		pe, ok := err.(clusterinfo.PartialErr)
+		if !ok {
+			s.ctx.nsqadmin.logf("ERROR: failed to %s topic/channel - %s", body.Action, err)
+			return nil, http_api.Err{502, fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
+		}
+		s.ctx.nsqadmin.logf("WARNING: %s", err)
+		messages = append(messages, pe.Error())
+	}
+
+	return struct {
+		Message string `json:"message"`
+	}{maybeWarnMsg(messages)}, nil
+}
+
 func (s *httpServer) topicChannelAction(req *http.Request, topicName string, channelName string) (interface{}, error) {
 	var messages []string
 
-	var body struct {
-		Action    string `json:"action"`
-		Timestamp string `json:"timestamp"`
-	}
+	var body ChannelActionRequest
 	err := json.NewDecoder(req.Body).Decode(&body)
 	if err != nil {
 		return nil, http_api.Err{400, err.Error()}
@@ -1083,39 +1284,36 @@ func (s *httpServer) topicChannelAction(req *http.Request, topicName string, cha
 	case "pause":
 		if channelName != "" {
 			err = s.ci.PauseChannel(topicName, channelName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
-
 			s.notifyAdminActionWithUser("pause_channel", topicName, channelName, "", req)
 		} else {
 			err = s.ci.PauseTopic(topicName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
-
 			s.notifyAdminActionWithUser("pause_topic", topicName, "", "", req)
 		}
 	case "unpause":
 		if channelName != "" {
 			err = s.ci.UnPauseChannel(topicName, channelName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
-
 			s.notifyAdminActionWithUser("unpause_channel", topicName, channelName, "", req)
 		} else {
 			err = s.ci.UnPauseTopic(topicName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
-
 			s.notifyAdminActionWithUser("unpause_topic", topicName, "", "", req)
 		}
 	case "skip":
 		if channelName != "" {
 			err = s.ci.SkipChannel(topicName, channelName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
+
 			if err == nil {
 				err = s.ci.EmptyChannel(topicName, channelName,
-					s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+					s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 					s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 			}
 			s.notifyAdminActionWithUser("skip_channel", topicName, channelName, "", req)
@@ -1123,21 +1321,37 @@ func (s *httpServer) topicChannelAction(req *http.Request, topicName string, cha
 	case "unskip":
 		if channelName != "" {
 			err = s.ci.UnSkipChannel(topicName, channelName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 
 			s.notifyAdminActionWithUser("unskip_channel", topicName, channelName, "", req)
 		}
+	case "skipZanTest":
+		if channelName != "" {
+			err = s.ci.SkipZanTest(topicName, channelName,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
+				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
+
+			s.notifyAdminActionWithUser("skip_zantest", topicName, channelName, "", req)
+		}
+	case "unskipZanTest":
+		if channelName != "" {
+			err = s.ci.UnskipZanTest(topicName, channelName,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
+				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
+
+			s.notifyAdminActionWithUser("unskip_zantest", topicName, channelName, "", req)
+		}
 	case "empty":
 		if channelName != "" {
 			err = s.ci.EmptyChannel(topicName, channelName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 
 			s.notifyAdminActionWithUser("empty_channel", topicName, channelName, "", req)
 		} else {
 			err = s.ci.EmptyTopic(topicName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses,
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC,
 				s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 
 			s.notifyAdminActionWithUser("empty_topic", topicName, "", "", req)
@@ -1145,7 +1359,7 @@ func (s *httpServer) topicChannelAction(req *http.Request, topicName string, cha
 	case "create":
 		if channelName != "" {
 			err = s.ci.CreateTopicChannel(topicName, channelName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses)
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC)
 
 			s.notifyAdminActionWithUser("create_channel", topicName, channelName, "", req)
 		}
@@ -1154,7 +1368,8 @@ func (s *httpServer) topicChannelAction(req *http.Request, topicName string, cha
 			//parse timestamp
 			tsStr := fmt.Sprintf("timestamp:%v", body.Timestamp)
 			err = s.ci.ResetChannel(topicName, channelName,
-				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses, tsStr)
+				s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC, tsStr)
+
 			s.notifyAdminActionWithUser("reset_channel", topicName, channelName, "", req)
 
 		}
@@ -1280,25 +1495,32 @@ func (s *httpServer) casAuthCallbackHandler(w http.ResponseWriter, req *http.Req
 
 func (s *httpServer) clusterStatsHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	//get leader lookupd
-	lookupdNodes, err := s.ci.ListAllLookupdNodes(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses)
+	clustersInfo := make([]*clusterinfo.ClusterNodeInfo, 0)
+	lookupdNodesDC, err := s.ci.ListAllLookupdNodes(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC)
 	if err != nil {
 		s.ctx.nsqadmin.logf("WARNING: failed to list lookupd nodes : %v", err)
 		return nil, err
 	} else {
-		if lookupdNodes.LeaderNode.ID != "" {
-			leaderAddr := net.JoinHostPort(lookupdNodes.LeaderNode.NodeIP, lookupdNodes.LeaderNode.HttpPort)
-			clusterNodeInfo, err := s.ci.GetClusterInfo([]string{leaderAddr})
-			if err != nil {
-				s.ctx.nsqadmin.logf("ERROR: failed to get cluster nodes stats - %s", err)
-				return nil, http_api.Err{502, fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
-			} else {
-				return clusterNodeInfo, nil
-			}
+		for _, lookupdNodes := range lookupdNodesDC {
+			if lookupdNodes.LeaderNode.ID != "" {
+				leaderAddr := net.JoinHostPort(lookupdNodes.LeaderNode.NodeIP, lookupdNodes.LeaderNode.HttpPort)
+				clusterNodeInfo, err := s.ci.GetClusterInfo([]string{leaderAddr})
+				clusterNodeInfo.DC = lookupdNodes.DC
+				if err != nil {
+					s.ctx.nsqadmin.logf("ERROR: failed to get cluster nodes stats - %s", err)
+					return nil, http_api.Err{502, fmt.Sprintf("UPSTREAM_ERROR: %s", err)}
+				} else {
+					clustersInfo = append(clustersInfo, clusterNodeInfo)
+				}
 
-		} else {
-			s.ctx.nsqadmin.logf("WARNING: failed to find lookupd leader at this moment")
-			return nil, http_api.Err{503, "Service Unavailable"}
+			} else {
+				s.ctx.nsqadmin.logf("WARNING: failed to find lookupd leader at this moment")
+				return nil, http_api.Err{503, "Service Unavailable"}
+			}
 		}
+		return struct {
+			ClustersInfo []*clusterinfo.ClusterNodeInfo `json:"clustersInfo"`
+		}{clustersInfo}, nil
 	}
 }
 
@@ -1326,7 +1548,7 @@ func (s *httpServer) statisticsHandler(w http.ResponseWriter, req *http.Request,
 		rankName = "Top10 topics in Hourly Pub Size(in bytes)"
 	}
 
-	producers, err := s.ci.GetProducers(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses, s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
+	producers, err := s.ci.GetProducers(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC, s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
 		if !ok {
@@ -1392,9 +1614,18 @@ func (s *httpServer) statisticsHandler(w http.ResponseWriter, req *http.Request,
 	case "channel-timeout":
 		fallthrough
 	case "channel-requeue":
-		for key, channelStat := range channelStatMap {
+		channelStatMapDC := make(map[string]*clusterinfo.ChannelStats)
+		for _, channelStat := range channelStatMap {
+			key := channelStat.TopicName + "/" + channelStat.ChannelName
+			if _, exist := channelStatMapDC[key]; !exist {
+				channelStatMapDC[key] = channelStat
+			} else {
+				channelStatMapDC[key].Merge(channelStat)
+			}
+		}
+		for _, channelStat := range channelStatMapDC {
 			item := &rankStats{
-				Name:         key,
+				Name:         channelStat.TopicName + "/" + channelStat.ChannelName,
 				RequeueCount: channelStat.RequeueCount,
 				TimeoutCount: channelStat.TimeoutCount,
 			}
@@ -1433,11 +1664,16 @@ func (s *httpServer) statisticsHandler(w http.ResponseWriter, req *http.Request,
 	}, nil
 }
 
+type dcCounter struct {
+	DC    string                   `json:"dc"`
+	Stats map[string]*counterStats `json:"stats"`
+}
+
 func (s *httpServer) counterHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	var messages []string
 	stats := make(map[string]*counterStats)
 
-	producers, err := s.ci.GetProducers(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddresses, s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
+	producers, err := s.ci.GetProducers(s.ctx.nsqadmin.opts.NSQLookupdHTTPAddressesDC, s.ctx.nsqadmin.opts.NSQDHTTPAddresses)
 	if err != nil {
 		pe, ok := err.(clusterinfo.PartialErr)
 		if !ok {

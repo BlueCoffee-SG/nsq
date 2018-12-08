@@ -152,7 +152,7 @@ func NewClientV2(id int64, conn net.Conn, opts *Options, tls *tls.Config) *Clien
 		Writer: newBufioWriterSize(conn, defaultBufferSize),
 
 		outputBufferSize:    int64(defaultBufferSize),
-		outputBufferTimeout: int64(250 * time.Millisecond),
+		outputBufferTimeout: int64(50 * time.Millisecond),
 
 		msgTimeout: int64(opts.MsgTimeout),
 
@@ -460,11 +460,15 @@ func (c *ClientV2) IncrSubError(delta int64) {
 		atomic.StoreInt64(&c.subErrCnt, 0)
 	} else if newCnt > 0 {
 		rdy := atomic.LoadInt64(&c.ReadyCount)
-		if newCnt > rdy*2 {
-			atomic.StoreInt64(&c.subErrCnt, rdy*2)
-		} else if delta < 0 && newCnt < rdy/2 {
+		if newCnt > rdy+4*slowDownThreshold {
+			atomic.StoreInt64(&c.subErrCnt, rdy+4*slowDownThreshold)
+		} else if delta < 0 && newCnt < rdy {
 			// try speed up error recover
-			atomic.StoreInt64(&c.subErrCnt, newCnt/2)
+			newCnt = atomic.AddInt64(&c.subErrCnt, -1*(rdy-newCnt)/4)
+			if newCnt < 0 {
+				atomic.StoreInt64(&c.subErrCnt, 0)
+			}
+			//atomic.StoreInt64(&c.subErrCnt, newCnt/2)
 		}
 	}
 
@@ -507,6 +511,14 @@ func (c *ClientV2) StartClose() {
 	c.SetReadyCount(0)
 	// mark this client as closing
 	atomic.StoreInt32(&c.State, stateClosing)
+}
+
+func (c *ClientV2) SkipZanTest() {
+	c.tryUpdateReadyState()
+}
+
+func (c *ClientV2) UnskipZanTest() {
+	c.tryUpdateReadyState()
 }
 
 func (c *ClientV2) Pause() {

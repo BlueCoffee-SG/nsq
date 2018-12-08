@@ -180,56 +180,73 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 				bytes.Equal(line[:3], []byte("REQ")) {
 				isSpecial = true
 				if len(line) < 21 {
-					left = left[:20-len(line)]
+					// the line will be invalid after the next read in Bufio reader
+					// so we need copy line to temp buffer
+					// the read will overwrite the slice line,
+					if len(tmpLine) < len(line) {
+						tmpLine = append(tmpLine, line[:len(line)-len(tmpLine)]...)
+					}
+					tmpLine = tmpLine[:len(line)]
+					copy(tmpLine, line)
+
+					left = left[:20-len(tmpLine)]
 					nr := 0
 					nr, err = io.ReadFull(client.Reader, left)
 					if err != nil {
 						nsqd.NsqLogger().LogErrorf("read param err:%v", err)
 					}
-					line = append(line, left[:nr]...)
-					tmpLine = tmpLine[:len(line)]
-					copy(tmpLine, line)
-					// the readslice will overwrite the slice line,
-					// so we should copy it and copy back.
+					tmpLine = append(tmpLine, left[:nr]...)
+
 					extra, extraErr := client.Reader.ReadSlice('\n')
 					tmpLine = append(tmpLine, extra...)
-					line = append(line[:0], tmpLine...)
+					line = tmpLine
 					if extraErr != nil {
 						nsqd.NsqLogger().LogErrorf("read param err:%v", extraErr)
 					}
 				}
 				params = append(params, line[:3])
 				if len(line) >= 21 {
+					// 16bytes msg id for both fin/req
 					params = append(params, line[4:20])
-					// it must be REQ
 					if bytes.Equal(line[:3], []byte("REQ")) {
+						// it must be REQ
 						if len(line) >= 22 {
 							params = append(params, line[21:len(line)-1])
+						} else {
+							nsqd.NsqLogger().LogErrorf("read invalid command line for req:%v", line)
 						}
 					} else {
-						params = append(params, line[20:])
+						// it must be FIN
+						if len(line) != 21 {
+							nsqd.NsqLogger().LogErrorf("read invalid command line for fin :%v", line)
+						}
 					}
 				} else {
-					params = append(params, []byte(""))
+					nsqd.NsqLogger().LogErrorf("read invalid command line :%v", line)
 				}
-
 			} else if len(line) >= 5 {
 				if bytes.Equal(line[:5], []byte("TOUCH")) {
 					isSpecial = true
 					if len(line) < 23 {
-						left = left[:23-len(line)]
+						if len(tmpLine) < len(line) {
+							tmpLine = append(tmpLine, line[:len(line)-len(tmpLine)]...)
+						}
+						tmpLine = tmpLine[:len(line)]
+						copy(tmpLine, line)
+						left = left[:23-len(tmpLine)]
 						nr := 0
 						nr, err = io.ReadFull(client.Reader, left)
 						if err != nil {
 							nsqd.NsqLogger().Logf("TOUCH param err:%v", err)
 						}
-						line = append(line, left[:nr]...)
+						tmpLine = append(tmpLine, left[:nr]...)
+						line = tmpLine
 					}
 					params = append(params, line[:5])
 					if len(line) >= 23 {
 						params = append(params, line[6:22])
 					} else {
-						params = append(params, []byte(""))
+						nsqd.NsqLogger().LogErrorf("read invalid command line :%v", line)
 					}
 				}
 			}
@@ -389,6 +406,8 @@ func (p *protocolV2) Exec(client *nsqd.ClientV2, params [][]byte) ([]byte, error
 		return p.MPUB(client, params)
 	case bytes.Equal(params[0], []byte("MPUB_TRACE")):
 		return p.MPUBTRACE(client, params)
+	case bytes.Equal(params[0], []byte("MPUB_EXT")):
+		return p.MPUBEXT(client, params)
 	case bytes.Equal(params[0], []byte("NOP")):
 		return p.NOP(client, params)
 	case bytes.Equal(params[0], []byte("TOUCH")):
@@ -1003,6 +1022,11 @@ func (p *protocolV2) internalSUB(client *nsqd.ClientV2, params [][]byte, enableT
 			return nil, protocol.NewFatalClientErr(nil, E_INVALID, ErrOrderChannelOnSampleRate.Error())
 		}
 		channel.SetOrdered(true)
+	} else {
+		if !topic.IsOrdered() && channel.IsOrdered() {
+			nsqd.NsqLogger().Infof("channel %v is in ordered state on non-order topic %v but with normal sub command, remote is : %v, should convert state to non-ordered with http api.",
+				channelName, topicName, client.String())
+		}
 	}
 
 	if startFrom != nil {
@@ -1175,7 +1199,12 @@ func (p *protocolV2) REQ(client *nsqd.ClientV2, params [][]byte) ([]byte, error)
 	topic, _ := p.ctx.getExistingTopic(client.Channel.GetTopicName(), client.Channel.GetTopicPart())
 	oldMsg, toEnd := client.Channel.ShouldRequeueToEnd(client.ID, client.String(),
 		msgID, timeoutDuration, true)
+	// the channel under non-order topic may also sub with ordered
+	isOrderedCh := client.Channel.IsOrdered()
 	if topic != nil && topic.IsOrdered() {
+		isOrderedCh = true
+	}
+	if isOrderedCh {
 		toEnd = false
 		// for ordered topic, disable defer since it may block the consume
 		if timeoutDuration > 0 {
@@ -1264,7 +1293,7 @@ func (p *protocolV2) internalCreateTopic(client *nsqd.ClientV2, params [][]byte)
 			fmt.Sprintf("CREATE_TOPIC is not allowed here while cluster feature enabled."))
 	}
 
-	topic := p.ctx.getTopic(topicName, partition, ext)
+	topic := p.ctx.getTopic(topicName, partition, ext, false)
 	if topic == nil {
 		return nil, protocol.NewClientErr(err, "E_CREATE_TOPIC_FAILED",
 			fmt.Sprintf("CREATE_TOPIC %v failed", topicName))
@@ -1348,12 +1377,16 @@ func (p *protocolV2) PUBEXT(client *nsqd.ClientV2, params [][]byte) ([]byte, err
 	return p.internalPubExtAndTrace(client, params, true, false)
 }
 
+func (p *protocolV2) MPUBEXT(client *nsqd.ClientV2, params [][]byte) ([]byte, error) {
+	return p.internalMPUBEXTAndTrace(client, params, true, false)
+}
+
 func (p *protocolV2) MPUBTRACE(client *nsqd.ClientV2, params [][]byte) ([]byte, error) {
-	return p.internalMPUBAndTrace(client, params, true)
+	return p.internalMPUBEXTAndTrace(client, params, false, true)
 }
 
 func (p *protocolV2) MPUB(client *nsqd.ClientV2, params [][]byte) ([]byte, error) {
-	return p.internalMPUBAndTrace(client, params, false)
+	return p.internalMPUBEXTAndTrace(client, params, false, false)
 }
 
 func getTracedReponse(id nsqd.MessageID, traceID uint64, offset nsqd.BackendOffset, rawSize int32) ([]byte, error) {
@@ -1501,19 +1534,10 @@ func (p *protocolV2) internalPubExtAndTrace(client *nsqd.ClientV2, params [][]by
 	}
 	if p.ctx.checkForMasterWrite(topicName, partition) {
 		if !topic.IsExt() && extContent.ExtVersion() != ext.NO_EXT_VER {
-			canIgnoreExt := true
-			if jsonHeader != nil {
-				// if only internal header, we can ignore
-				m, _ := jsonHeader.Map()
-				for k, _ := range m {
-					// for future, if any internal header can not be ignored, we should check here
-					if !strings.HasPrefix(k, "##") {
-						canIgnoreExt = false
-						nsqd.NsqLogger().Debugf("custom ext content can not be ignored in topic: %v, %v", topicName, k)
-						break
-					}
-				}
+			if p.ctx.getOpts().AllowExtCompatible {
+				filterIllegalZanTestHeader(topicName, jsonHeader)
 			}
+			canIgnoreExt := canIgnoreJsonHeader(topicName, jsonHeader)
 			if p.ctx.getOpts().AllowExtCompatible && canIgnoreExt {
 				extContent = ext.NewNoExt()
 				nsqd.NsqLogger().Debugf("ext content ignored in topic: %v", topicName)
@@ -1563,15 +1587,15 @@ func (p *protocolV2) internalPubExtAndTrace(client *nsqd.ClientV2, params [][]by
 	}
 }
 
-func (p *protocolV2) internalMPUBAndTrace(client *nsqd.ClientV2, params [][]byte, traceEnable bool) ([]byte, error) {
+func (p *protocolV2) internalMPUBEXTAndTrace(client *nsqd.ClientV2, params [][]byte, mpubExt bool, traceEnable bool) ([]byte, error) {
 	startPub := time.Now().UnixNano()
 	_, topic, preErr := p.preparePub(client, params, p.ctx.getOpts().MaxBodySize, true)
 	if preErr != nil {
 		return nil, preErr
 	}
 
-	messages, buffers, preErr := readMPUB(client.Reader, client.LenSlice, topic,
-		p.ctx.getOpts().MaxMsgSize, p.ctx.getOpts().MaxBodySize, traceEnable)
+	messages, buffers, preErr := readMPUBEXT(client.Reader, client.LenSlice, topic,
+		p.ctx.getOpts().MaxMsgSize, p.ctx.getOpts().MaxBodySize, traceEnable, mpubExt, p.ctx.getOpts().AllowExtCompatible)
 
 	defer func() {
 		for _, b := range buffers {
@@ -1647,6 +1671,11 @@ func (p *protocolV2) TOUCH(client *nsqd.ClientV2, params [][]byte) ([]byte, erro
 
 func readMPUB(r io.Reader, tmp []byte, topic *nsqd.Topic, maxMessageSize int64,
 	maxBodySize int64, traceEnable bool) ([]*nsqd.Message, []*bytes.Buffer, error) {
+	return readMPUBEXT(r, tmp, topic, maxMessageSize, maxBodySize, traceEnable, false, false)
+}
+
+func readMPUBEXT(r io.Reader, tmp []byte, topic *nsqd.Topic, maxMessageSize int64,
+	maxBodySize int64, traceEnable bool, mpubExt bool, allowExtCompatible bool) ([]*nsqd.Message, []*bytes.Buffer, error) {
 	numMessages, err := readLen(r, tmp)
 	if err != nil {
 		return nil, nil, protocol.NewFatalClientErr(err, "E_BAD_BODY", "MPUB failed to read message count")
@@ -1662,6 +1691,8 @@ func readMPUB(r io.Reader, tmp []byte, topic *nsqd.Topic, maxMessageSize int64,
 
 	messages := make([]*nsqd.Message, 0, numMessages)
 	buffers := make([]*bytes.Buffer, 0, numMessages)
+	topicName := topic.GetTopicName()
+	topicExt := topic.IsExt()
 	for i := int32(0); i < numMessages; i++ {
 		messageSize, err := readLen(r, tmp)
 		if err != nil {
@@ -1685,29 +1716,121 @@ func readMPUB(r io.Reader, tmp []byte, topic *nsqd.Topic, maxMessageSize int64,
 		if err != nil {
 			return nil, buffers, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE", "MPUB failed to read message body")
 		}
+
+		//parse ext header or trace
 		msgBody := b.Bytes()[:messageSize]
 
 		traceID := uint64(0)
+		var extJsonBytes []byte
 		var realBody []byte
-		if traceEnable {
+		var extJsonLen uint16
+		var canIgnoreExt bool
+		if traceEnable && !mpubExt {
 			if messageSize <= nsqd.MsgTraceIDLength {
 				return nil, buffers, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
 					fmt.Sprintf("MPUB invalid message(%d) body size %d for tracing", i, messageSize))
 			}
 			traceID = binary.BigEndian.Uint64(msgBody[:nsqd.MsgTraceIDLength])
 			realBody = msgBody[nsqd.MsgTraceIDLength:]
+		} else if mpubExt {
+			//read two byte header length
+			extJsonLen = binary.BigEndian.Uint16(msgBody[:nsqd.MsgJsonHeaderLength])
+			//check json length, make sure it does not exceed slice length
+			if messageSize <= nsqd.MsgJsonHeaderLength+int32(extJsonLen) {
+				return nil, buffers, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
+					fmt.Sprintf("invalid body size %d in ext json header content length", messageSize))
+			}
+			extJsonBytes = msgBody[nsqd.MsgJsonHeaderLength : nsqd.MsgJsonHeaderLength+extJsonLen]
+			//parse trace id, if there is a json ext
+			if extJsonLen > 0 {
+				jsonHeader, err := simpleJson.NewJson(extJsonBytes)
+				if err != nil {
+					return nil, buffers, protocol.NewClientErr(err, ext.E_INVALID_JSON_HEADER, "fail to parse json header")
+				}
+
+				//parse traceID, if there is any
+				traceIDJson, existInJsonHeader := jsonHeader.CheckGet(ext.TRACE_ID_KEY)
+				if existInJsonHeader {
+					traceIDStr, err := traceIDJson.String()
+					if err != nil {
+						return nil, buffers, protocol.NewClientErr(err, "INVALID_TRACE_ID", "passin trace id should be string")
+					}
+					traceID, err = strconv.ParseUint(traceIDStr, 10, 0)
+					if err != nil {
+						return nil, buffers, protocol.NewClientErr(err, "INVALID_TRACE_ID", "invalid trace id")
+					}
+				}
+				//check compatibility when topic does not support ext
+				if !topicExt {
+					if allowExtCompatible {
+						filterIllegalZanTestHeader(topicName, jsonHeader)
+					}
+					canIgnoreExt = canIgnoreJsonHeader(topicName, jsonHeader)
+					if allowExtCompatible && canIgnoreExt {
+						nsqd.NsqLogger().Debugf("ext content ignored in topic: %v", topicName)
+					} else {
+						nsqd.NsqLogger().Infof("ext content not supported in topic: %v", topicName)
+						return nil, buffers, protocol.NewClientErr(nil, ext.E_EXT_NOT_SUPPORT,
+							fmt.Sprintf("ext content not supported in topic %v", topicName))
+					}
+				}
+
+			}
+			realBody = msgBody[nsqd.MsgJsonHeaderLength+extJsonLen:]
 		} else {
 			realBody = msgBody
 		}
 
 		var msg *nsqd.Message
-		msg = nsqd.NewMessage(0, realBody)
+		if mpubExt && extJsonLen > 0 && topicExt {
+			msg = nsqd.NewMessageWithExt(0, realBody, ext.JSON_HEADER_EXT_VER, extJsonBytes)
+		} else {
+			msg = nsqd.NewMessage(0, realBody)
+		}
 		msg.TraceID = traceID
 		messages = append(messages, msg)
 		topic.GetDetailStats().UpdateTopicMsgStats(int64(len(realBody)), 0)
 	}
 
 	return messages, buffers, nil
+}
+
+//remove any zan_test header in json ext if value != true(bool, string)
+func filterIllegalZanTestHeader(topicName string, jsonHeader *simpleJson.Json) {
+	if jsonHeader != nil {
+		flag, exist := jsonHeader.CheckGet(ext.ZAN_TEST_KEY)
+		if exist {
+			tb, err := flag.Bool()
+			if err != nil {
+				ts, _ := flag.String()
+				if ts != "" {
+					tb, _ = strconv.ParseBool(ts)
+				}
+			}
+			if !tb {
+				jsonHeader.Del(ext.ZAN_TEST_KEY)
+				nsqd.NsqLogger().Debugf("illegal zan test header removed in topic: %v, %v", topicName, flag)
+			}
+		}
+	}
+}
+
+//return true when there are only preserved kv in json header, and false otherwise
+func canIgnoreJsonHeader(topicName string, jsonHeader *simpleJson.Json) bool {
+	canIgnoreExt := true
+	if jsonHeader != nil {
+		// if only internal header, we can ignore
+		m, _ := jsonHeader.Map()
+		for k, _ := range m {
+			// for future, if any internal header can not be ignored, we should check here
+			if !strings.HasPrefix(k, "##") {
+				canIgnoreExt = false
+				nsqd.NsqLogger().Debugf("custom ext content can not be ignored in topic: %v, %v", topicName, k)
+				break
+			}
+		}
+	}
+	return canIgnoreExt
 }
 
 // validate and cast the bytes on the wire to a message ID

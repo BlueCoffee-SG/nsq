@@ -14,13 +14,16 @@ var AppState = Backbone.Model.extend({
             'STATSD_PREFIX': STATSD_PREFIX,
             'NSQLOOKUPD': NSQLOOKUPD,
             'ALLNSQLOOKUPDS': ALLNSQLOOKUPDS,
+            'DCNSQLOOKUPD' : DCNSQLOOKUPD,
+            'DCALLNSQLOOKUPDS': DCALLNSQLOOKUPDS,
             'graph_interval': '2h',
             'AUTH_URL' : AUTH_URL,
             'LOGOUT_URL' : LOGOUT_URL,
             'LOGIN'         : LOGIN,
             'USER'          : USER,
             'AUTH_ENABLED'  : AUTH_ENABLED,
-            'HAS_ENDPOINT'  : HAS_ENDPOINT
+            'HAS_ENDPOINT'  : HAS_ENDPOINT,
+            'ENABLE_ZAN_TEST_SKIP' : ENABLE_ZAN_TEST_SKIP,
         };
     },
 

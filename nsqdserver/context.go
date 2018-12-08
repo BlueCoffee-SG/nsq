@@ -102,11 +102,11 @@ func (c *context) getExistingTopic(name string, part int) (*nsqd.Topic, error) {
 	return c.nsqd.GetExistingTopic(name, part)
 }
 
-func (c *context) getTopic(name string, part int, ext bool) *nsqd.Topic {
+func (c *context) getTopic(name string, part int, ext bool, ordered bool) *nsqd.Topic {
 	if ext {
-		return c.nsqd.GetTopicWithExt(name, part)
+		return c.nsqd.GetTopicWithExt(name, part, ordered)
 	} else {
-		return c.nsqd.GetTopic(name, part)
+		return c.nsqd.GetTopic(name, part, ordered)
 	}
 }
 
@@ -225,7 +225,7 @@ func (c *context) DeleteExistingChannel(topic *nsqd.Topic, channelName string) e
 	return c.nsqdCoord.DeleteChannel(topic, channelName)
 }
 
-func (c *context) UpdateChannelState(ch *nsqd.Channel, paused int, skipped int) error {
+func (c *context) UpdateChannelState(ch *nsqd.Channel, paused int, skipped int, zanTestSkipped int) error {
 	var err error
 	if c.nsqdCoord == nil {
 		switch paused {
@@ -242,8 +242,15 @@ func (c *context) UpdateChannelState(ch *nsqd.Channel, paused int, skipped int) 
 			err = ch.UnSkip()
 		}
 
+		switch int32(zanTestSkipped) {
+		case nsqd.ZanTestSkip:
+			err = ch.SkipZanTest()
+		case nsqd.ZanTestUnskip:
+			err = ch.UnskipZanTest()
+		}
+
 	} else {
-		err = c.nsqdCoord.UpdateChannelStateToCluster(ch, paused, skipped)
+		err = c.nsqdCoord.UpdateChannelStateToCluster(ch, paused, skipped, zanTestSkipped)
 	}
 	if err != nil {
 		nsqd.NsqLogger().Logf("failed to update channel(%v) state pause: %v, skip: %v, topic %v, err: %v", ch.GetName(), paused, skipped, ch.GetTopicName(), err)

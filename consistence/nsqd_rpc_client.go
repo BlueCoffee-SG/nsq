@@ -2,14 +2,15 @@ package consistence
 
 import (
 	"bytes"
+	"io"
+	"sync"
+	"time"
+
 	"github.com/absolute8511/gorpc"
 	pb "github.com/youzan/nsq/consistence/coordgrpc"
 	"github.com/youzan/nsq/nsqd"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"sync"
-	"time"
-	"io"
 )
 
 const (
@@ -101,7 +102,7 @@ func (self *NsqdRpcClient) Close() {
 }
 
 func (self *NsqdRpcClient) ShouldRemoved() bool {
-	r := false
+	r := true
 	self.Lock()
 	if self.c != nil {
 		r = self.c.ShouldRemoved()
@@ -157,7 +158,7 @@ func (self *NsqdRpcClient) CallWithRetry(method string, arg interface{}) (interf
 		if err != nil {
 			cerr, ok := err.(*gorpc.ClientError)
 			if (ok && cerr.Connection) || self.ShouldRemoved() {
-				coordLog.Infof("rpc connection closed, error: %v", err)
+				coordLog.Warningf("rpc connection %v closed, error: %v", self.remote, err)
 				connErr := self.Reconnect()
 				if connErr != nil {
 					return reply, err
@@ -278,20 +279,6 @@ func (self *NsqdRpcClient) TriggerLookupChanged() error {
 	return err
 }
 
-func (self *NsqdRpcClient) NotifyUpdateChannelOffset(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, channel string, offset ChannelConsumerOffset) *CoordErr {
-	var updateInfo RpcChannelOffsetArg
-	updateInfo.TopicName = info.Name
-	updateInfo.TopicPartition = info.Partition
-	updateInfo.TopicWriteEpoch = info.EpochForWrite
-	updateInfo.Epoch = info.Epoch
-	updateInfo.TopicLeaderSessionEpoch = leaderSession.LeaderEpoch
-	updateInfo.TopicLeaderSession = leaderSession.Session
-	updateInfo.Channel = channel
-	updateInfo.ChannelOffset = offset
-	err := self.dc.Send("UpdateChannelOffset", &updateInfo)
-	return convertRpcError(err, nil)
-}
-
 func (self *NsqdRpcClient) NotifyChannelList(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, chList []string) *CoordErr {
 	var updateInfo RpcChannelListArg
 	updateInfo.TopicName = info.Name
@@ -318,7 +305,7 @@ func (self *NsqdRpcClient) DeleteChannel(leaderSession *TopicLeaderSession, info
 	return convertRpcError(err, retErr)
 }
 
-func (self *NsqdRpcClient) UpdateChannelState(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, channel string, paused int, skipped int) *CoordErr {
+func (self *NsqdRpcClient) UpdateChannelState(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, channel string, paused int, skipped int, zanTestSkipped int) *CoordErr {
 	var channelState RpcChannelState
 	channelState.TopicName = info.Name
 	channelState.TopicPartition = info.Partition
@@ -329,6 +316,7 @@ func (self *NsqdRpcClient) UpdateChannelState(leaderSession *TopicLeaderSession,
 	channelState.Channel = channel
 	channelState.Paused = paused
 	channelState.Skipped = skipped
+	channelState.ZanTestSkipped = zanTestSkipped
 
 	retErr, err := self.CallWithRetry("UpdateChannelState", &channelState)
 	return convertRpcError(err, retErr)
@@ -348,6 +336,8 @@ func (self *NsqdRpcClient) UpdateChannelOffset(leaderSession *TopicLeaderSession
 		req.TopicData = &rpcData
 		req.Channel = channel
 		req.ChannelOffset.Voffset = offset.VOffset
+		// TODO: VCnt for pb
+		// req.ChannelOffset.VCnt = offset.VCnt
 		req.ChannelOffset.Flush = offset.Flush
 		req.ChannelOffset.AllowBackward = offset.AllowBackward
 
@@ -371,6 +361,20 @@ func (self *NsqdRpcClient) UpdateChannelOffset(leaderSession *TopicLeaderSession
 	updateInfo.ChannelOffset = offset
 	retErr, err := self.CallFast("UpdateChannelOffset", &updateInfo)
 	return convertRpcError(err, retErr)
+}
+
+func (self *NsqdRpcClient) NotifyUpdateChannelOffset(leaderSession *TopicLeaderSession, info *TopicPartitionMetaInfo, channel string, offset ChannelConsumerOffset) *CoordErr {
+	var updateInfo RpcChannelOffsetArg
+	updateInfo.TopicName = info.Name
+	updateInfo.TopicPartition = info.Partition
+	updateInfo.TopicWriteEpoch = info.EpochForWrite
+	updateInfo.Epoch = info.Epoch
+	updateInfo.TopicLeaderSessionEpoch = leaderSession.LeaderEpoch
+	updateInfo.TopicLeaderSession = leaderSession.Session
+	updateInfo.Channel = channel
+	updateInfo.ChannelOffset = offset
+	err := self.dc.Send("UpdateChannelOffset", &updateInfo)
+	return convertRpcError(err, nil)
 }
 
 func (self *NsqdRpcClient) UpdateDelayedQueueState(leaderSession *TopicLeaderSession,

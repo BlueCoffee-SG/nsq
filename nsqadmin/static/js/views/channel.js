@@ -18,6 +18,7 @@ var ChannelView = BaseView.extend({
     events: {
         'click .consumer-actions button': 'consumerAction',
         'click .channel-actions button': 'channelAction',
+        'click button#finish-msg': 'finishMessageAction',
         'blur .channel-actions input#resetChannelDatetime': 'resettsValidate',
         'click .toggle h4': 'onToggle',
         'click .toggle h4 span a': 'onToggle',
@@ -60,6 +61,30 @@ var ChannelView = BaseView.extend({
             .always(Pubsub.trigger.bind(Pubsub, 'view:ready'));
     },
 
+    finishMessageAction: function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var action = $(e.currentTarget).data('action');
+        var node = $(e.currentTarget).data('node');
+        var partition = $(e.currentTarget).data('partition');
+        var topic = this.model.get('topic');
+        var callback = function(msgId) {
+                           if(msgId && msgId<=0) {
+                               this.showError("Invalid message internal ID");
+                           } else if(msgId) {
+                               $.post(this.model.adminUrl(), JSON.stringify({'action': action, 'node': node, 'msgid': msgId, 'partition': partition}))
+                                   .done(function() { window.location.reload(true); })
+                                   .fail(this.handleAJAXError.bind(this));
+                           }
+                       }.bind(this);
+
+        bootbox.prompt({
+            title: "input message internal ID you would like to FIN",
+            inputType: 'number',
+            callback: callback
+        });
+    },
+
     channelAction: function(e) {
         e.preventDefault();
         e.stopPropagation();
@@ -89,6 +114,12 @@ var ChannelView = BaseView.extend({
                $.post(this.model.url(), JSON.stringify({'action': action, 'timestamp': '' + ts}))
                                    .done(function() { window.location.reload(true); })
                                    .fail(this.handleAJAXError.bind(this));
+//            } else if(action === 'finish'){
+//                var msgId = $('input[name=msgIdForFin]').val();
+//                var nodePar_sel = $('select[name=nodeParSelect]').val();
+//                $.post(this.model.adminUrl(), JSON.stringify({'action': action, 'nodePartition': nodePar_sel, 'msgid': msgId}))
+//                                    .done(function() { window.location.reload(true); })
+//                                    .fail(this.handleAJAXError.bind(this));
             } else {
                 $.post(this.model.url(), JSON.stringify({'action': action}))
                     .done(function() { window.location.reload(true); })
@@ -106,12 +137,16 @@ var ChannelView = BaseView.extend({
                 '/' + this.model.get('name') + '</em>';
             txt = txt + '?';
             var topic = this.model.get('topic')
+            var order = this.model.get('is_multi_ordered')
             bootbox.confirm(txt, function(result) {
                 if (result !== true) {
                     return;
                 }
 
-                $.post(this.model.url() + "/client", JSON.stringify({'action': action}))
+                $.post(this.model.url() + "/client", JSON.stringify({
+                                                'action': action,
+                                                'order': order
+                                            }))
                     .done(function() { window.location.reload(true); })
                     .fail(this.handleAJAXError.bind(this));
             }.bind(this));
